@@ -1,0 +1,19 @@
+[package]
+name = "toy-test"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+tokio = "1"
+msim = { path = "../../msim" }
+msim-macros = { path = "../../msim-macros" }
+sui = { path = "../../../sui"}
+
+
+[patch.crates-io]
+tokio = { path = "../../msim-tokio" }
+futures-timer = { path = "../../mocked-crates/futures-timer" }
+
