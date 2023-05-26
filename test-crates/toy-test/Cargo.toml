@@ -1,5 +1,5 @@
 [package]
-name = "toy-test"
+name = "jsonrpsee-test"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,9 +8,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 tokio = "1"
+jsonrpsee = { version = "0.16.1", features = ["server", "macros", "http-client", "wasm-client", "client-ws-transport", "client-web-transport", "client-core"] }
+jsonrpsee-core = "0.16.1"
 msim = { path = "../../msim" }
 msim-macros = { path = "../../msim-macros" }
-sui = { path = "../../../sui"}
 
 
 [patch.crates-io]

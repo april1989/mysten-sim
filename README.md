@@ -26,9 +26,49 @@ We want to:
 1. Replace `register_fail_point_async` with `tokio.yield()`
 2. Implement necessary steps in the scheduler of msim
 
-Run the following command if you do not install sui crates:
+Run the following command:
 ```shell 
 cd test-crates/toy-test
-RUSTFLAGS="--cfg msim" cargo test --manifest-path ../../../sui/Cargo.toml
+RUSTFLAGS="--cfg msim" cargo test
 ```
-BUT ALL FAIL COMPILE NOW.
+
+#### async messages in test_create_advance_epoch_tx_race
+We simulate the async messages in the test, where we run a jsonrpsee server instead of running a sui validator like `test_create_advance_epoch_tx_race`.
+
+```shell
+                               TestClusterBuilder                   
+                                      | [create]
+                                      ⌄
+                                    node2 (node id = 2)
+                                      | [add to queue]
+                                      ⌄
+                          msim::sim::task::run_all_ready() 
+                                      | [whenever it's node2's turn, let it await for broadcast msg]
+                                      ⌄
+change_epoch_delay_tx ------------> node2 (receive the message and continue)                                     
+                                      |
+                                      ⌄
+reconfig_delay_tx     ------------> node2 (receive the message and continue) 
+                                      |
+                                      ⌄
+                                     ...
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

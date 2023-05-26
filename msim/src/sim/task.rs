@@ -325,6 +325,14 @@ impl Executor {
                 continue;
             }
             // run task
+            if info.name() != "main" {
+                info!( // bz
+                    "Executor running task with id {:?}, name {:?}",
+                    info.node(),
+                    info.name(),
+                );
+            }
+
             let node_id = info.node();
             let _guard = crate::context::enter_task(info);
             let panic_guard = PanicGuard(self);
