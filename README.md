@@ -17,6 +17,10 @@ RUSTFLAGS="--cfg msim" cargo test
 or add `RUSTFLAGS` to environment variable.
 
 
+### entry of simtest (macros)
+
+`sim_test`@`msim_macros/src/lib.rs:158`, which has the main body of `parse_test`@`msim_macros/src/lib.rs:165`.
+
 
 ### toy_test
 
@@ -33,7 +37,8 @@ RUSTFLAGS="--cfg msim" cargo test
 ```
 
 #### async messages in test_create_advance_epoch_tx_race
-We simulate the async messages in the test, where we run a jsonrpsee server instead of running a sui validator like `test_create_advance_epoch_tx_race`.
+We simulate the async messages in the test, where we run a jsonrpsee dummy server instead of running a sui validator like `test_create_advance_epoch_tx_race`,
+and use `real_tokio::task::spawn` instead of `register_fail_point_async`.
 
 ```shell
                                TestClusterBuilder                   
