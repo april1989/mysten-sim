@@ -50,13 +50,16 @@ and use `real_tokio::task::spawn` instead of `register_fail_point_async`.
                           msim::sim::task::run_all_ready() 
                                       | [whenever it's node2's turn, let it await for broadcast msg]
                                       ⌄
-change_epoch_delay_tx ------------> node2 (receive the message and continue)                                     
+panic!("safe mode recorded"); <---- node2 (fail_point!("record_checkpoint_builder_is_safe_mode_metric"); @sui/crates/sui-core/src/authority/authority_per_epoch_store.rs)                                     
                                       |
                                       ⌄
-reconfig_delay_tx     ------------> node2 (receive the message and continue) 
+register_fail_point_async     <---- node2 (fail_point_async!("change_epoch_tx_delay"); @sui/crates/sui-core/src/authority.rs) 
                                       |
                                       ⌄
-                                     ...
+register_fail_point_async     <---- node2 (fail_point_async!("reconfig_delay"); @sui/crates/sui-node/src/lib.rs)
+                                      |
+                                      ⌄
+                                     ... (test sends txs to stop the async fns of register_fail_point_async)
 ```
 
 
