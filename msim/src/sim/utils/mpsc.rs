@@ -76,6 +76,21 @@ impl<T> Receiver<T> {
         let mut queue = self.inner.queue.lock().unwrap();
         if !queue.is_empty() {
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
+            // tracing::info!("rand idx = {:?} with queue.len = {:?}", idx, queue.len()); // bz: debug
+            Ok(queue.swap_remove(idx))
+        } else if Arc::weak_count(&self.inner) == 0 {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    // bz: a simplest try: we always let idx == queue.len() - 1 run firstly
+    pub fn try_simple_schedule(&self) -> Result<T, TryRecvError> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        if !queue.is_empty() {
+            let idx = queue.len() - 1;
+            tracing::info!("try_simple_schedule: idx = {:?}", idx);
             Ok(queue.swap_remove(idx))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)

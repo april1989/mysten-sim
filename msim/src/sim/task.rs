@@ -226,7 +226,7 @@ impl Future for YieldToScheduler {
 /// scheduler.
 pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     info!("calling instrumented_yield"); // bz: debug
-    // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+    info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
 
     Box::pin(YieldToScheduler::default())
 }
@@ -274,10 +274,11 @@ impl Executor {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
                 return val;
-            }else{
-                // info!("polling task in block_on: {:?}", task);
-                info!("polling task in block_on() after run_all_ready()"); // bz: debug 
-            }
+            } 
+            
+            //// bz: debug
+            // info!("polling task in block_on: {:?}", task);
+            info!("polling task in block_on() after run_all_ready()"); 
             
             let going = self.time.advance_to_next_event();
             assert!(going, "no events, the task will block forever");
@@ -321,7 +322,8 @@ impl Executor {
             }
         }));
 
-        while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
+        // while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
+        while let Ok((runnable, info)) = self.queue.try_simple_schedule() {
             if *info.killed.borrow() {
                 // killed task: must enter the task before dropping it, so that
                 // Drop impls can run.
@@ -329,11 +331,22 @@ impl Executor {
                 std::mem::drop(runnable);
                 continue;
             } else if info.paused.load(Ordering::SeqCst) {
+                // if info.name() == "validator" {
+                //     info!("-> Executor seeing validator AGAIN, resume it for next iteration.");
+                //     self.handle.resume(info.node()); // bz: send to queue
+                //     continue;
+                // }
+                
                 // paused task: push to waiting list
                 let mut nodes = self.nodes.lock().unwrap();
                 nodes.get_mut(&info.node()).unwrap().paused.push(runnable);
                 continue;
             }
+            // else if info.name() == "validator" {
+            //     info!("-> Executor seeing validator, pause it for this iteration.");
+            //     self.handle.pause(info.node());
+            // }
+
             // run task
             if info.name() != "main" {
                 info!( // bz: debug
@@ -357,7 +370,7 @@ impl Executor {
 
                 // Examine stack trace of previously yielded task
                 info!("captured task info: {:?}\ncaptured stack: {:?}", _task.node(), _captured_stack); // bz: debug
-
+                
             }
 
             if let Err(err) = result {

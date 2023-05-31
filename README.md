@@ -72,9 +72,9 @@ register_fail_point_async     <---- node2 (fail_point_async!("reconfig_delay"); 
 
 - create an instance of type `Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>` and push to `LAST_CAPTURE` for future polls??
 
-- `Executor.handle.nodes` (of type `TaskHandle`) stores a map of node id (`NodeID`) and its node (a.k.a., runnable task), where `TaskHandle` controls it's start/resume/pause.
+- `Executor.handle.nodes` (of type `TaskHandle`) stores a map of node id (`NodeId`) and its node (a.k.a., runnable task), where `TaskHandle` controls it's start/resume/pause.
 
-- `TaskNodeHandle::spawn_local()` is where a task has been add back to `Executor.sender` (is `TaskNodeHandle.sender` from `TaskHandle.sender` from `Executor.sender`), then get received and drained by `Executor.queue` in `Executor::run_all_ready()`.
+- `TaskNodeHandle::spawn_local()` (called by `TaskEnteringFuture::spawn()`) is where a task has been add back to `Executor.sender` (is `TaskNodeHandle.sender` from `TaskHandle.sender` from `Executor.sender`), then get received and drained by `Executor.queue` in `Executor::run_all_ready()`.
 
 - `Executor` currently randomly picks a task, where the random number is `Executor.rand` (created by `Runtime::with_seed_and_config()`):
 ```Rust
