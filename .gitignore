@@ -4,3 +4,4 @@ Cargo.lock
 test-crates/jsonrpsee-test/target
 test-crates/toy-test/target
 .idea
+.vscode

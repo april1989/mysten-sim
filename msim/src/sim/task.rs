@@ -178,6 +178,8 @@ impl Future for YieldToScheduler {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        info!("polling backtrace: {}", std::backtrace::Backtrace::force_capture()); // bz: debug
+
         // capture the current stack trace
         LAST_CAPTURE.with(|last_capture| {
             let mut last_capture = last_capture.lock().unwrap();
@@ -190,6 +192,7 @@ impl Future for YieldToScheduler {
                 }
                 (Some(_), None) => {
                     // the scheduler cleared the capture, so we are ready to resume.
+                    info!("poll ready");
                     Poll::Ready(())
                 }
                 (None, Some(_)) => {
@@ -221,8 +224,11 @@ impl Future for YieldToScheduler {
 /// possible for an intermediate future to poll() the YieldToScheduler instance again before it is
 /// woken.  However, we do guarantee not to wake the future until execution has returned to the
 /// scheduler.
-pub fn instrumented_yield() -> Box<dyn Future<Output = ()>> {
-    Box::new(YieldToScheduler::default())
+pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    info!("calling instrumented_yield"); // bz: debug
+    // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+
+    Box::pin(YieldToScheduler::default())
 }
 
 fn take_last_capture() -> Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>> {
@@ -268,7 +274,11 @@ impl Executor {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
                 return val;
+            }else{
+                // info!("polling task in block_on: {:?}", task);
+                info!("polling task in block_on() after run_all_ready()"); // bz: debug 
             }
+            
             let going = self.time.advance_to_next_event();
             assert!(going, "no events, the task will block forever");
             if let Some(limit) = self.time_limit {
@@ -326,7 +336,7 @@ impl Executor {
             }
             // run task
             if info.name() != "main" {
-                info!( // bz
+                info!( // bz: debug
                     "Executor running task with id {:?}, name {:?}",
                     info.node(),
                     info.name(),
@@ -346,6 +356,8 @@ impl Executor {
                 waker.wake_by_ref();
 
                 // Examine stack trace of previously yielded task
+                info!("captured task info: {:?}\ncaptured stack: {:?}", _task.node(), _captured_stack); // bz: debug
+
             }
 
             if let Err(err) = result {
@@ -563,6 +575,9 @@ impl TaskNodeHandle {
             // Safety: The schedule is not Sync,
             // the task's Waker must be used and dropped on the original thread.
             async_task::spawn_unchecked(future, move |runnable| {
+                if info.inner.name != "main" { // bz: debug
+                    info!("send in TaskNodeHandle: id {:?}, name {:?}", info.inner.node, info.inner.name);
+                }
                 let _ = sender.send((runnable, info.clone()));
             })
         };
