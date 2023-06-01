@@ -68,9 +68,12 @@ register_fail_point_async     <---- node2 (fail_point_async!("reconfig_delay"); 
 
 ### Things to do
 
-`instrument_yield()` currently only captures the current stack trace, and `LAST_CAPTURE` is empty. We need to make the current task yield execution back to the scheduler (a.k.a., `Executor`) by: 
+`instrument_yield()` currently only captures the current stack trace, and `LAST_CAPTURE` is empty. 
+We need to make the current task yield execution back to the scheduler (a.k.a., `Executor`) by: 
 
-- wherever `instrument_yield()` is placed, we should pause the tasks there and wait for our scheduler.
+- wherever `instrument_yield()` is placed, we should pause the tasks there and wait for our scheduler. We can call `context::current_task()` to get the correponding `TaskInfo`, and push instances to `LAST_CAPTURE` in order to trigger yield by `Future::YieldToScheduler::poll()`
+
+- `LAST_CAPTURE` is of type `Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>`, which only stores one instance. We need a vec to maintain the order of received yield tasks, as well as a map between task id and its corrsponding `Arc<TaskInfo>, Waker, Backtrace`
 
 - `Executor.handle.nodes` (of type `TaskHandle`) stores a map of node id (`NodeId`) and its node (a.k.a., runnable task), where `TaskHandle` controls a task's start/resume/pause.
 
@@ -87,17 +90,25 @@ Another place to control the tasks is through `TaskHandle` (or `Handle`) to star
 
 Hence, we can control the order of tasks in two ways:
 - replace `try_recv_random()` to a scheduler
-  -> rewrite `mpsc::channel()`, especially `Receiver`
+  -> rewrite `mpsc::channel()`
 - manipulate the order by resuming/pausing a task through `TaskHandle`
 
+- implement task id in `TaskInfo`
 
-### Questions
 
-1. which function determines when a task (runnable) should be paused and sent back to the scheduler? 
-2. how to pause a task where `instrument_yield()` has been called? 
-  -> we can do `context::current_task()` to get the correponding `TaskInfo`, get and push the node to `sender`
-3. create an instance of type `Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>` and push to `LAST_CAPTURE` for future polls?
 
+
+### Scheduler
+- step1, static analysis to identify potential points to insert instrumented_yield (manually insert a few instrumented_yield points)
+- step2, profile to capture a trace => compute a set of schedules. *how to get a trace?*
+- step3, enforce every schedule from the computed set of schedules. *for now, just assume we have a naive reverse order schedule*, e.g., 
+
+consider we only have three `instrumented_yield` points: p1, p2, p3 running on task id 100, 200, 300. 
+we emunerate all their orders:
+100 -> 200 -> 300
+100 -> 300 -> 200
+...
+rerun for 6 times
 
 
 
