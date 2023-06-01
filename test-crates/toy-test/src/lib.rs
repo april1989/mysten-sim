@@ -77,14 +77,6 @@ mod test {
         info!("in test_toy waiting.");
 
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        info!("in test_toy waiting.");
-
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        info!("in test_toy waiting.");
-
-
         // kill the jsonrpsee server node
         msim::runtime::Handle::current().kill(node.id());
     }

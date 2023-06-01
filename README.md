@@ -70,27 +70,33 @@ register_fail_point_async     <---- node2 (fail_point_async!("reconfig_delay"); 
 
 `instrument_yield()` currently only captures the current stack trace, and `LAST_CAPTURE` is empty. We need to make the current task yield execution back to the scheduler (a.k.a., `Executor`) by: 
 
-- create an instance of type `Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>` and push to `LAST_CAPTURE` for future polls??
+- wherever `instrument_yield()` is placed, we should pause the tasks there and wait for our scheduler.
 
-- `Executor.handle.nodes` (of type `TaskHandle`) stores a map of node id (`NodeId`) and its node (a.k.a., runnable task), where `TaskHandle` controls it's start/resume/pause.
+- `Executor.handle.nodes` (of type `TaskHandle`) stores a map of node id (`NodeId`) and its node (a.k.a., runnable task), where `TaskHandle` controls a task's start/resume/pause.
 
 - `TaskNodeHandle::spawn_local()` (called by `TaskEnteringFuture::spawn()`) is where a task has been add back to `Executor.sender` (is `TaskNodeHandle.sender` from `TaskHandle.sender` from `Executor.sender`), then get received and drained by `Executor.queue` in `Executor::run_all_ready()`.
 
-- `Executor` currently randomly picks a task, where the random number is `Executor.rand` (created by `Runtime::with_seed_and_config()`):
+- `Executor` currently randomly picks a task, where the random number is `Executor.rand` (created in function `Runtime::with_seed_and_config()`):
 ```Rust
 let mut rand = rand::GlobalRng::new_with_seed(seed);
 tokio::msim_adapter::util::reset_rng(rand.gen::<u64>());
 ```
 and the task index is determined by `try_recv_random()`.
 
-Another place to control the tasks is through `TaskHandle` (or `Handle`) to start/resume/pause a task directly. Meanwhile, `Executor` cooperates by checking `info.paused` or `info.killed`.
+Another place to control the tasks is through `TaskHandle` (or `Handle`) to start/resume/pause a task directly. Meanwhile, `Executor` cooperates by checking `info.paused` or `info.killed` to avoid running a paused or killed tasks.
 
 Hence, we can control the order of tasks in two ways:
-- replace `try_recv_random()` to a scheduler. 
+- replace `try_recv_random()` to a scheduler
+  -> rewrite `mpsc::channel()`, especially `Receiver`
 - manipulate the order by resuming/pausing a task through `TaskHandle`
 
 
+### Questions
 
+1. which function determines when a task (runnable) should be paused and sent back to the scheduler? 
+2. how to pause a task where `instrument_yield()` has been called? 
+  -> we can do `context::current_task()` to get the correponding `TaskInfo`, get and push the node to `sender`
+3. create an instance of type `Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>` and push to `LAST_CAPTURE` for future polls?
 
 
 
