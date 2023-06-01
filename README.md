@@ -89,7 +89,7 @@ and the task index is determined by `try_recv_random()`.
 Another place to control the tasks is through `TaskHandle` (or `Handle`) to start/resume/pause a task directly. Meanwhile, `Executor` cooperates by checking `info.paused` or `info.killed` to avoid running a paused or killed tasks.
 
 Hence, we can control the order of tasks in two ways:
-- replace `try_recv_random()` to a scheduler
+- (use this) replace `try_recv_random()` to a scheduler
   -> rewrite `mpsc::channel()`
 - manipulate the order by resuming/pausing a task through `TaskHandle`
 
