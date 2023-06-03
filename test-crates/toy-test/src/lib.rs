@@ -52,7 +52,7 @@ mod test {
         let ip = std::net::IpAddr::from_str("10.1.1.1").unwrap();
         let handle = msim::runtime::Handle::current();
         let builder = handle.create_node();
-        let node = builder
+        let node = builder // builder of type NodeBuilder
             .ip(ip)
             .name("validator")
             .init(|| async {
@@ -71,7 +71,6 @@ mod test {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
-
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");

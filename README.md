@@ -93,7 +93,7 @@ Hence, we can control the order of tasks in two ways:
   -> rewrite `mpsc::channel()`
 - manipulate the order by resuming/pausing a task through `TaskHandle`
 
-- implement task id in `TaskInfo`
+- implement task id of type `TaskId` for `TaskInfo`
 
 
 
