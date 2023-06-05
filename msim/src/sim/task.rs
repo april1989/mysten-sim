@@ -148,7 +148,7 @@ pub(crate) struct TaskInfo {
     paused: AtomicBool,
     /// A flag indicating that the task should no longer be executed.
     killed: watch::Sender<bool>,
-    
+
     task_id: Arc<TaskId>, // bz: task id
 }
 
@@ -200,6 +200,14 @@ impl Future for YieldToScheduler {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         info!("polling backtrace"); // bz: debug
 
+        let handle = runtime::Handle::current();
+        let mut last_captures = handle.task.last_captures.lock().unwrap();
+        let task = context::current_task();
+        let new_capture = Arc::new((task, cx.waker().clone(), Backtrace::new()));
+        last_captures.push(new_capture);
+
+        info!("#last_captures = {:?}", last_captures.len());
+
         // capture the current stack trace
         LAST_CAPTURE.with(|last_capture| {
             let mut last_capture = last_capture.lock().unwrap();
@@ -207,19 +215,20 @@ impl Future for YieldToScheduler {
                 (Some(this), Some(last)) => {
                     assert!(Arc::ptr_eq(this, last));
                     // we were polled again before control reached the scheduler
-                    warn!("YieldToScheduler polled before being woken");
+                    info!("YieldToScheduler polled before being woken");
                     Poll::Pending
                 }
                 (Some(_), None) => {
                     // the scheduler cleared the capture, so we are ready to resume.
                     info!("poll ready");
-                    Poll::Ready(())
-                    // Poll::Pending
+                    // Poll::Ready(())
+                    Poll::Pending
                 }
                 (None, Some(_)) => {
                     // If this happens and can't be avoided, we could keep a Vec instead of Option
                     // in LAST_CAPTURE, although the scheduler will have no ability to change the
                     // ordering of such events.
+                    info!("poll panic");
                     panic!(
                         "instrumented_yield() called twice before control returned to scheduler"
                     );
@@ -247,27 +256,52 @@ impl Future for YieldToScheduler {
 /// woken.  However, we do guarantee not to wake the future until execution has returned to the
 /// scheduler.
 pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    info!("calling instrumented_yield"); // bz: debug
+    let ret = Box::pin(YieldToScheduler::default());
+
+    let line = "-----".repeat(16);
+    info!("{}", line);
     // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
 
-    // bz: record the current node and task 
+    // bz: record the current task
     let info = context::current_task(); // return type is TaskInfo
-    info!( // bz: debug
+    info!(
+        // bz: debug
         "Yield current task with node id {:?}, name {:?}, task id {:?}",
-        info.node(), info.name(), info.task_id,
+        info.node(),
+        info.name(),
+        info.task_id,
     );
 
     let handle = runtime::Handle::current();
     let mut order = handle.task.order.lock().unwrap();
-    order.push(info);
+    order.push(info.clone());
 
-    // bz: debug 
-    info!("Current order has: ");
+    // bz: debug
+    info!("Current order is (after push): len = {:?}", order.len());
     for e in order.iter() {
-        info!(" - node id {:?}, name {:?}, task id {:?}", e.node(), e.name(), e.task_id);
+        info!(
+            " - node id {:?}, name {:?}, task id {:?}",
+            e.node(), e.name(), e.task_id
+        );
     }
+    drop(order);
 
-    Box::pin(YieldToScheduler::default())
+    let last_captures = handle.task.last_captures.lock().unwrap();
+    info!("#last_captures = {:?}", last_captures.len());
+
+    // LAST_CAPTURE.with(|last_capture| {
+    //     let mut last_capture = last_capture.lock().unwrap();
+    //     let waker = futures::task::noop_waker();
+    //     let mut cx = Context::from_waker(&waker);
+    //     let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
+    //     *last_capture = Some(new_capture.clone()).into();
+    // });
+    // info!("LAST_CAPTURE recorded: {:?}", LAST_CAPTURE);
+
+    info!("{}", line);
+
+    ret
+
 }
 
 fn take_last_capture() -> Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>> {
@@ -285,6 +319,7 @@ impl Executor {
                 next_node_id: Arc::new(AtomicU64::new(1)),
                 next_task_id: Arc::new(AtomicU64::new(1)),
                 order: Arc::new(Mutex::new(Vec::new())),
+                last_captures: Arc::new(Mutex::new(Vec::new())),
             },
             time: TimeRuntime::new(&rand),
             rand,
@@ -315,12 +350,12 @@ impl Executor {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
                 return val;
-            } 
-            
+            }
+
             //// bz: debug
             // info!("polling task in block_on: {:?}", task);
-            // info!("polling task in block_on() after run_all_ready()"); 
-            
+            // info!("polling task in block_on() after run_all_ready()");
+
             let going = self.time.advance_to_next_event();
             assert!(going, "no events, the task will block forever");
             if let Some(limit) = self.time_limit {
@@ -381,11 +416,34 @@ impl Executor {
 
             // run task
             if info.name() != "main" {
-                info!( // bz: debug
+                info!(
+                    // bz: debug
                     "-> executor running task with node id {:?}, name {:?}, task id {:?}",
-                    info.node(), info.name(), info.task_id,
+                    info.node(),
+                    info.name(),
+                    info.task_id,
                 );
             }
+
+            // bz: remove this task from the order 
+            let mut order = self.handle.order.lock().unwrap();
+            if order.len() > 0 {
+                if let Some(pos) = order.iter().position(|x| (*x).task_id == info.task_id) {
+                    order.remove(pos);
+                }
+        
+                // bz: debug
+                info!("Current order is (after remove): len = {:?}", order.len());
+                for e in order.iter() {
+                    info!(
+                        " - node id {:?}, name {:?}, task id {:?}",
+                        e.node(), e.name(), e.task_id
+                    );
+                }
+            }else{
+                info!("Current order is empty.");
+            }
+            drop(order);
 
             let node_id = info.node();
             let _guard = crate::context::enter_task(info);
@@ -397,11 +455,15 @@ impl Executor {
 
             if let Some(capture) = take_last_capture() {
                 let (_task, waker, _captured_stack) = &*capture;
+                info!("LAST_CAPTURE's waker: {:?}", waker);
                 waker.wake_by_ref();
 
-                // Examine stack trace of previously yielded task
-                info!("captured task info: {:?}\ncaptured stack: {:?}", _task.node(), _captured_stack); // bz: debug
-                
+                // // Examine stack trace of previously yielded task
+                // info!(
+                //     "captured task info: {:?}\ncaptured stack: {:?}",
+                //     _task.node(),
+                //     _captured_stack
+                // ); // bz: debug
             }
 
             if let Err(err) = result {
@@ -457,6 +519,7 @@ pub(crate) struct TaskHandle {
 
     // bz: record the order of yield tasks
     order: Arc<Mutex<Vec<Arc<TaskInfo>>>>,
+    last_captures: Arc<Mutex<Vec<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>>,
 }
 assert_send_sync!(TaskHandle);
 
@@ -523,7 +586,10 @@ impl TaskHandle {
         let id = NodeId(self.next_node_id.fetch_add(1, Ordering::SeqCst));
         let name = name.unwrap_or_else(|| format!("node-{}", id.0));
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
-        info!("creating node id = {:?} name = {:?} task id = {:?}", id, name, task_id); // bz: debug
+        info!(
+            "creating node id = {:?} name = {:?} task id = {:?}",
+            id, name, task_id
+        ); // bz: debug
         let info = Arc::new(TaskInfo::new(id, task_id, name));
         let handle = TaskNodeHandle {
             sender: self.sender.clone(),
@@ -625,8 +691,12 @@ impl TaskNodeHandle {
             // Safety: The schedule is not Sync,
             // the task's Waker must be used and dropped on the original thread.
             async_task::spawn_unchecked(future, move |runnable| {
-                if info.inner.name != "main" { // bz: debug
-                    info!("-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}", info.inner.node, info.inner.name, info.task_id);
+                if info.inner.name != "main" {
+                    // bz: debug
+                    info!(
+                        "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
+                        info.inner.node, info.inner.name, info.task_id
+                    );
                 }
                 let _ = sender.send((runnable, info.clone()));
             })

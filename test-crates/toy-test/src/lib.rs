@@ -14,6 +14,9 @@ mod test {
             .build("10.1.1.1:80".parse::<SocketAddr>()?)
             .await?;
 
+        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
         let mut module = RpcModule::new(());
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
@@ -29,7 +32,7 @@ mod test {
         // we kill this server at the end
         if !handle.is_stopped() {
             info!("i am running");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
@@ -69,12 +72,18 @@ mod test {
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        info!("in test_toy waiting.");
+        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
+        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        info!("in test_toy waiting.");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        info!("in test_toy waiting.");
 
         // kill the jsonrpsee server node
         msim::runtime::Handle::current().kill(node.id());

@@ -100,6 +100,7 @@ Hence, we can control the order of tasks in two ways:
 
 ### Scheduler
 - step1, static analysis to identify potential points to insert instrumented_yield (manually insert a few instrumented_yield points)
+  -> task-dependency analysis
 - step2, profile to capture a trace => compute a set of schedules. *how to get a trace?*
 - step3, enforce every schedule from the computed set of schedules. *for now, just assume we have a naive reverse order schedule*, e.g., 
 
