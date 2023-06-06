@@ -14,9 +14,6 @@ mod test {
             .build("10.1.1.1:80".parse::<SocketAddr>()?)
             .await?;
 
-        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
         let mut module = RpcModule::new(());
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
@@ -35,7 +32,7 @@ mod test {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
+        instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
 
         info!("i am awake");
 
@@ -72,12 +69,10 @@ mod test {
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
-        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
+        instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
-
-        instrumented_yield(); // assume we have a fail_point here replaced by instrumented_yield
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
