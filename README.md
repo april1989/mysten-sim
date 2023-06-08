@@ -90,11 +90,8 @@ Another place to control the tasks is through `TaskHandle` (or `Handle`) to star
 
 Hence, we can control the order of tasks in two ways:
 - (use this) replace `try_recv_random()` to a scheduler
-  -> rewrite `mpsc::channel()`
+  -> rewrite `mpsc::channel()` to `task::channel()`
 - manipulate the order by resuming/pausing a task through `TaskHandle`
-
-- implement task id of type `TaskId` for `TaskInfo`
-
 
 
 
@@ -115,12 +112,74 @@ rerun for 6 times
 
 
 
+### Things already done
+
+Currently, the scheduler only works when there is only one `instrumented_yield().await` called in a task.
+
+- implement task id of type `TaskId` for `TaskInfo`
+- implement `order` and `last_captures` in `TaskHandle` to record the order of yield tasks, wakers, and backtraces
+- implement `RELEASE` a global flag of whether it is the time to release yield tasks
+- logic: 
+  * in `instrumented_yield()`, we record the task has been yield and store to `order`
+  * in `YieldToScheduler::poll()`, we collect the corresponding yield taskinfo, waker and backtrace that has been just yielded in `instrumented_yield()`; the reason of why we have to collect the info here is because the waker is only available here under context
+  * when we collect enough yield tasks (i.e., #task == `NUM_INSTRUMENTED_YIELDS`), we set `RELEASE` to true and wake all the yield tasks in `Executor::run_all_ready()`
+  * the next task is picked by `Receiver::try_simple_schedule()`: 
+    - when there is no element in `order` or `RELEASE == false`, we randomly pick a task and return it to executor
+    - when `RELEASE == true`, we return the yield tasks in their reverse order in `order`
+    - when there are elements in `order` but `RELEASE == false`, we randomly pick a task that is not in `order` and return it to executor
+
+- NOTE: the code below `channel()` in `msim/src/sim/task.rs` should be in a separate file, however, we have to use the crate-private trait `TaskInfo` and for convenience of accessing the above fields, we put them in the `task.rs` file
 
 
 
 
+#### Real scenario in test_create_advance_epoch_tx_race 
+
+from log2.txt:
+
+```shell
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:271: Current order has: # the order of all the called instrumented_yield from total 5 tasks
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from change_epoch_tx_delay -> next_epoch=1
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(1), name "client", task id TaskId(1) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from change_epoch_tx_delay -> next_epoch=2
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(1), name "client", task id TaskId(1) # from reconfig_delay
+```
+
+how to determine when to release all yield tasks???
+- we know the locations where we add `instrumented_yield().await`: loc1, loc2, ... 
+- whenever we see all the locations for the same task id, we release the yield tasks for the same task id, e.g., 
+```shell
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from change_epoch_tx_delay 
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from change_epoch_tx_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(4), name "k#99f25ef6..", task id TaskId(4) # from reconfig_delay --------> we seen all the instrumented_yield locations for task id 4: then release all the yield tasks in task id 4
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(5), name "k#addeef94..", task id TaskId(5) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(2), name "k#b3fd5efb..", task id TaskId(2) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(3), name "k#8dcff6d1..", task id TaskId(3) # from reconfig_delay
+INFO node{id=1 task_id=1 name="client"}: msim::sim::task: /home/ubuntu/mysten-sim/msim/src/sim/task.rs:273:  - node id NodeId(1), name "client", task id TaskId(1) # from reconfig_delay
+```
 
 
+- we need some data structure to record this process
+- all tasks in queue are the yield tasks, the executor has no task to run 
 
+```shell
+MSIM_WATCHDOG_TIMEOUT_MS=20000 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim cargo simtest test_create_advance_epoch_tx_race # increase timeout to wait for other sending tasks and avoid deadlock detection
+``` 
 
 
