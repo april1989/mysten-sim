@@ -20,7 +20,7 @@ mod test {
         let addr = server.local_addr()?;
         let handle = server.start(module)?;
 
-        info!("starting validator node server handler ... ");
+        info!("starting validator node server handler 0 ... ");
 
         // // In this example we don't care about doing shutdown so let's it run forever.
         // // You may use the `ServerHandle` to shut it down or manage it yourself.
@@ -28,13 +28,73 @@ mod test {
 
         // we kill this server at the end
         if !handle.is_stopped() {
-            info!("i am running");
+            info!("i am running 0");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
 
-        info!("i am awake");
+        info!("i am awake 0");
+
+        Ok(addr)
+    }
+
+    pub async fn run_server1() -> anyhow::Result<SocketAddr> {
+        let server = ServerBuilder::default()
+            .build("10.1.1.1:81".parse::<SocketAddr>()?)
+            .await?;
+
+        let mut module = RpcModule::new(());
+        module.register_method("validator method", |_, _| Ok("lo"))?;
+
+        let addr = server.local_addr()?;
+        let handle = server.start(module)?;
+
+        info!("starting validator node server handler 1 ... ");
+
+        // // In this example we don't care about doing shutdown so let's it run forever.
+        // // You may use the `ServerHandle` to shut it down or manage it yourself.
+        // tokio::spawn(handle.stopped());
+
+        // we kill this server at the end
+        if !handle.is_stopped() {
+            info!("i am running 1");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        info!("i am awake 1");
+
+        Ok(addr)
+    }
+
+    pub async fn run_server2() -> anyhow::Result<SocketAddr> {
+        let server = ServerBuilder::default()
+            .build("10.1.1.1:82".parse::<SocketAddr>()?)
+            .await?;
+
+        let mut module = RpcModule::new(());
+        module.register_method("validator method", |_, _| Ok("lo"))?;
+
+        let addr = server.local_addr()?;
+        let handle = server.start(module)?;
+
+        info!("starting validator node server handler 2 ... ");
+
+        // // In this example we don't care about doing shutdown so let's it run forever.
+        // // You may use the `ServerHandle` to shut it down or manage it yourself.
+        // tokio::spawn(handle.stopped());
+
+        // we kill this server at the end
+        if !handle.is_stopped() {
+            info!("i am running 2");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        info!("i am awake 2");
 
         Ok(addr)
     }
@@ -63,6 +123,14 @@ mod test {
         // let node run
         node.spawn(async move {
             run_server().await.unwrap();
+        });
+
+        node.spawn(async move {
+            run_server1().await.unwrap();
+        });
+
+        node.spawn(async move {
+            run_server2().await.unwrap();
         });
 
         // wait til node fully started and enter the instrument_yield()

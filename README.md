@@ -32,32 +32,6 @@ cd test-crates/toy-test
 RUSTFLAGS="--cfg msim" cargo test
 ```
 
-#### async messages in test_create_advance_epoch_tx_race
-We simulate the async messages in the test, where we run a jsonrpsee dummy server instead of running a sui validator like `test_create_advance_epoch_tx_race`,
-and use `real_tokio::task::spawn` instead of `register_fail_point_async`.
-
-```shell
-                               TestClusterBuilder                   
-                                      | [create]
-                                      ⌄
-                                    node2 (node id = 2)
-                                      | [add to queue]
-                                      ⌄
-                          msim::sim::task::run_all_ready() 
-                                      | [whenever it's node2's turn, let it await for broadcast msg]
-                                      ⌄
-panic!("safe mode recorded"); <---- node2 (fail_point!("record_checkpoint_builder_is_safe_mode_metric"); @sui/crates/sui-core/src/authority/authority_per_epoch_store.rs)                                     
-                                      |
-                                      ⌄
-register_fail_point_async     <---- node2 (fail_point_async!("change_epoch_tx_delay"); @sui/crates/sui-core/src/authority.rs) 
-                                      |
-                                      ⌄
-register_fail_point_async     <---- node2 (fail_point_async!("reconfig_delay"); @sui/crates/sui-node/src/lib.rs)
-                                      |
-                                      ⌄
-                                     ... (test sends txs to stop the async fns of register_fail_point_async)
-```
-
 
 
 ## Implementation
@@ -130,7 +104,50 @@ Currently, the scheduler only works when there is only one `instrumented_yield()
 
 - NOTE: the code below `channel()` in `msim/src/sim/task.rs` should be in a separate file, however, we have to use the crate-private trait `TaskInfo` and for convenience of accessing the above fields, we put them in the `task.rs` file
 
+- where to increment task id:
+  * for a newly created node with the following trace, we increment the task id for the code executed by this node
+  ```shell
+   0: msim::sim::task::TaskNodeHandle::spawn_local::{{closure}}
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:797:45
+   1: async_task::raw::RawTask<F,T,S>::schedule
+             at /home/ubuntu/.cargo/git/checkouts/async-task-2c3ead35a682b15c/4e45b26/src/raw.rs:414:9
+   2: async_task::runnable::Runnable::schedule
+             at /home/ubuntu/.cargo/git/checkouts/async-task-2c3ead35a682b15c/4e45b26/src/runnable.rs:272:13
+   3: msim::sim::task::TaskNodeHandle::spawn_local
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:802:9
+   4: msim::sim::runtime::NodeBuilder::init::{{closure}} # -> creating a new node
+             at /home/ubuntu/mysten-sim/msim/src/sim/runtime/mod.rs:404:13
+   5: msim::sim::task::TaskHandle::create_node
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:684:13
+   6: msim::sim::runtime::NodeBuilder::build
+             at /home/ubuntu/mysten-sim/msim/src/sim/runtime/mod.rs:417:20
+   7: toy_test::test::test_toy::{{closure}}::{{closure}}::{{closure}}
+             at ./src/lib.rs:115:20
+   8: <core::pin::Pin<P> as core::future::future::Future>::poll
+             at /rustc/9eb3afe9ebe9c7d2b84b71002d44f4a0edac95e0/library/core/src/future/future.rs:125:9
+  ```
+  * for a task spawned by a node with the following trace, we increment the task id for this task
+  ```shell
+   0: msim::sim::task::TaskNodeHandle::spawn_local::{{closure}}
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:797:45
+   1: async_task::raw::RawTask<F,T,S>::schedule
+             at /home/ubuntu/.cargo/git/checkouts/async-task-2c3ead35a682b15c/4e45b26/src/raw.rs:414:9
+   2: async_task::runnable::Runnable::schedule
+             at /home/ubuntu/.cargo/git/checkouts/async-task-2c3ead35a682b15c/4e45b26/src/runnable.rs:272:13
+   3: msim::sim::task::TaskNodeHandle::spawn_local
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:802:9
+   4: msim::sim::task::TaskNodeHandle::spawn # -> spawning a new task
+             at /home/ubuntu/mysten-sim/msim/src/sim/task.rs:740:9
+   5: msim::sim::runtime::NodeHandle::spawn
+             at /home/ubuntu/mysten-sim/msim/src/sim/runtime/mod.rs:463:9
+   6: toy_test::test::test_toy::{{closure}}::{{closure}}::{{closure}}
+             at ./src/lib.rs:124:9
+   7: <core::pin::Pin<P> as core::future::future::Future>::poll
+             at /rustc/9eb3afe9ebe9c7d2b84b71002d44f4a0edac95e0/library/core/src/future/future.rs:125:9
+  ```
+  * to distinguish the two types of tasks, we update the task id in `msim::sim::task::TaskNodeHandle::spawn`
 
+  * NOTE: uncertain change in `crate::task::spawn_local()`
 
 
 #### Real scenario in test_create_advance_epoch_tx_race 
@@ -183,3 +200,10 @@ MSIM_WATCHDOG_TIMEOUT_MS=20000 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim cargo sim
 ``` 
 
 
+### Goal 
+
+reproduce the race test with instrumented_yield:
+
+- we have 4 validator nodes, each node spawns two tasks each called `instrumented_yield()`
+- we only need to yield the two tasks in one validator node
+- how can we panic when entering the safe mode without register fail point?

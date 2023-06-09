@@ -192,7 +192,8 @@ thread_local! {
     static LAST_CAPTURE: Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>> = Mutex::new(None);
 }
 
-const NUM_INSTRUMENTED_YIELDS: usize = 2; // bz: how many instrumented_yield() exists in a test case
+const DEBUG: bool = false; // DEBUG = true: print out all debug info, this can be super long
+const NUM_INSTRUMENTED_YIELDS: usize = 4; // bz: how many instrumented_yield() exists in a test case
 static RELEASE: AtomicBool = AtomicBool::new(false); // bz: flag of whether it is the time to release yield tasks
 
 /// bz: set RELEASE to true
@@ -213,75 +214,92 @@ impl Future for YieldToScheduler {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let line = "*****".repeat(15);
-        info!("{}", line);
-        info!("polling backtrace"); // bz: debug
+        if DEBUG {
+            info!("{}",  "*****".repeat(15));
+            info!("polling backtrace"); // bz: debug
+        }
 
         let info = context::current_task(); // bz: current task info
-        info!(
-            // bz: debug
-            "working on task with node id {:?}, name {:?}, task id {:?}",
-            info.node(),
-            info.name(),
-            info.task_id,
-        );
+        if DEBUG {
+            info!(
+                // bz: debug
+                "working on task with node id {:?}, name {:?}, task id {:?}",
+                info.node(),
+                info.name(),
+                info.task_id,
+            );
+        }
 
         let handle = runtime::Handle::current();
         let order = handle.task.order.lock().unwrap();
         let l_order = order.len();
 
         if get_release() {
-            // bz: the following if else is for debugging
-            if l_order == 0 {
-                // bz: already send all yield tasks to executor
-                info!("already send all yield tasks to executor, waiting to run.");
-            } else {
-                // bz: already waked all yield tasks in last poll
-                info!("already waked all yield tasks.");
+            if DEBUG {
+                // bz: the following if else is for debugging
+                if l_order == 0 {
+                    // bz: already send all yield tasks to executor
+                    info!("already send all yield tasks to executor, waiting to run.");
+                } else {
+                    // bz: already waked all yield tasks in last poll
+                    info!("already waked all yield tasks.");
+                }
+                info!("{}",  "*****".repeat(15));
             }
-
-            info!("{}", line);
             return Poll::Ready(());
         }
 
-        assert!(l_order > 0, "the order should not be empty."); // bz: must push to order before this point
+        assert!(l_order > 0, "Executor: the order should not be empty."); // bz: must push to order before this point
 
         let mut last_captures = handle.task.last_captures.lock().unwrap();
         let l_last_captures = last_captures.len();
-        info!(
-            "#order = {:?} #last_captures = {:?}",
-            l_order, l_last_captures
-        );
+
+        if DEBUG {
+            info!(
+                "#order = {:?} #last_captures = {:?}",
+                l_order, l_last_captures
+            );
+        }
+
         let _task_id = &order[l_order - 1].task_id.clone();
         drop(order); // bz: early drop the lock
 
         if info.task_id == _task_id.clone() {
             if l_last_captures == l_order {
-                info!("pushed the same task already, got polled again. skip.");
+                if DEBUG {
+                    info!("pushed the same task already, got polled again. skip.");
+                }
             } else if l_last_captures == l_order - 1 {
                 // bz: we havent push this task to last_captures, push now
-                info!(
-                    // bz: debug
-                    "pushing task with node id {:?}, name {:?}, task id {:?}",
-                    info.node(),
-                    info.name(),
-                    info.task_id,
-                );
+                if DEBUG {
+                    info!(
+                        // bz: debug
+                        "pushing task with node id {:?}, name {:?}, task id {:?}",
+                        info.node(),
+                        info.name(),
+                        info.task_id,
+                    );
+                }
                 let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
                 last_captures.push(new_capture);
 
-                info!("#last_captures = {:?} (after push)", last_captures.len());
+                if DEBUG {
+                    info!("#last_captures = {:?} (after push)", last_captures.len());
+                }
             }
         }
 
         if last_captures.len() == NUM_INSTRUMENTED_YIELDS {
             // bz: we collected all the instrumented_yield() exists in a test case
             // now let them get ready
-            info!("poll ready.");
-            info!("{}", line);
-            set_release_to_true();
+            if DEBUG {
+                info!("poll ready.");
+                info!("{}",  "*****".repeat(15));
+            }
 
+            set_release_to_true();
             drop(last_captures);
+
             return Poll::Ready(());
         }
 
@@ -303,7 +321,9 @@ impl Future for YieldToScheduler {
         //     }
         // }
 
-        info!("{}", line);
+        if DEBUG {
+            info!("{}",  "*****".repeat(15));
+        }
 
         Poll::Pending
 
@@ -355,37 +375,42 @@ impl Future for YieldToScheduler {
 /// woken.  However, we do guarantee not to wake the future until execution has returned to the
 /// scheduler.
 pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    let line = "-----".repeat(15);
-    info!("{}", line); // bz: debug
-                       // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+    if DEBUG {
+        info!("{}", "-----".repeat(15)); // bz: debug
+                           // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+    }
 
     // bz: record the current task
     let info = context::current_task(); // return type is TaskInfo
-    info!(
-        // bz: debug
-        "Yield current task with node id {:?}, name {:?}, task id {:?}",
-        info.node(),
-        info.name(),
-        info.task_id,
-    );
+    if DEBUG {
+        info!(
+            // bz: debug
+            "Yield current task with node id {:?}, name {:?}, task id {:?}",
+            info.node(),
+            info.name(),
+            info.task_id,
+        );
+    }
 
     let handle = runtime::Handle::current();
     let mut order = handle.task.order.lock().unwrap();
     order.push(info.clone());
 
-    // bz: debug
-    info!("Current order is (after push): #order = {:?}", order.len());
-    for e in order.iter() {
-        info!(
-            " - node id {:?}, name {:?}, task id {:?}",
-            e.node(),
-            e.name(),
-            e.task_id
-        );
+    if DEBUG {
+        // bz: debug
+        info!("Current order is (after push): #order = {:?}", order.len());
+        for e in order.iter() {
+            info!(
+                " - node id {:?}, name {:?}, task id {:?}",
+                e.node(),
+                e.name(),
+                e.task_id
+            );
+        }
+        info!("{}", "-----".repeat(15)); // bz: debug
     }
-    drop(order);
 
-    info!("{}", line); // bz: debug
+    drop(order);
 
     Box::pin(YieldToScheduler::default())
 }
@@ -501,7 +526,7 @@ impl Executor {
             }
 
             // run task
-            if info.name() != "main" {
+            if DEBUG && info.name() != "main" {
                 info!(
                     // bz: debug
                     "-> executor running task with node id {:?}, name {:?}, task id {:?}",
@@ -536,16 +561,23 @@ impl Executor {
             let mut last_captures = self.handle.last_captures.lock().unwrap();
             if get_release() && last_captures.len() > 0 {
                 // bz:  wake up the yield tasks
-                let line = ".....".repeat(15);
-                info!("{}", line);
+                if DEBUG {
+                    info!("{}", ".....".repeat(15));
+                    info!("Wake all yield tasks and clear last_captures.");
+                }
 
-                info!("Wake all yield tasks and clear last_captures.");
                 for capture in last_captures.iter() {
                     let (_task, waker, _captured_stack) = (*capture).deref();
-                    info!(" - waking task id {:?}", _task.task_id);
                     waker.wake_by_ref();
+
+                    if DEBUG {
+                        info!(" - waking task id {:?}", _task.task_id);
+                    }
                 }
-                info!("{}", line);
+
+                if DEBUG {
+                    info!("{}", ".....".repeat(15));
+                }
 
                 last_captures.clear();
             }
@@ -671,10 +703,15 @@ impl TaskHandle {
         let id = NodeId(self.next_node_id.fetch_add(1, Ordering::SeqCst));
         let name = name.unwrap_or_else(|| format!("node-{}", id.0));
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
-        info!(
-            "creating node id = {:?} name = {:?} task id = {:?}",
-            id, name, task_id
-        ); // bz: debug
+
+        if DEBUG {
+            info!(
+                // bz: debug
+                "creating node id = {:?} name = {:?} task id = {:?}",
+                id, name, task_id
+            );
+        }
+
         let info = Arc::new(TaskInfo::new(id, task_id, name));
         let handle = TaskNodeHandle {
             sender: self.sender.clone(),
@@ -732,15 +769,38 @@ impl TaskNodeHandle {
         self.info.node()
     }
 
+    /// bz: only tasks spawned by a node is called by this spawn function
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.spawn_local(future)
+        // bz: this is a new task spawned by the node, create a new info
+        let handle = runtime::Handle::current();
+        let mut next_task_id = handle.task.next_task_id;
+        let new_task_id = TaskId(next_task_id.fetch_add(1, Ordering::SeqCst));
+        let new_info = Arc::new(TaskInfo::new(
+            self.info.inner.node,
+            new_task_id,
+            self.info.inner.name.clone(),
+        ));
+
+        if DEBUG {
+            info!(
+                // bz: debug
+                "creating task: node id = {:?} name = {:?} task id = {:?} (increment task id)",
+                new_info.inner.node, new_info.inner.name, new_info.task_id
+            );
+        }
+
+        self.spawn_local(future, Some(new_info))
     }
 
-    pub fn spawn_local<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub fn spawn_local<F>(
+        &self,
+        future: F,
+        new_info: Option<Arc<TaskInfo>>,
+    ) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
         F::Output: 'static,
@@ -776,14 +836,33 @@ impl TaskNodeHandle {
             // Safety: The schedule is not Sync,
             // the task's Waker must be used and dropped on the original thread.
             async_task::spawn_unchecked(future, move |runnable| {
-                if info.inner.name != "main" {
-                    // bz: debug
-                    info!(
-                        "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
-                        info.inner.node, info.inner.name, info.task_id
-                    );
+                // info!( // bz: debug
+                //     "get backtrace:\n{}",
+                //     std::backtrace::Backtrace::force_capture()
+                // );
+                match &new_info {
+                    Some(_info) => {
+                        if DEBUG && _info.inner.name != "main" {
+                            // bz: debug
+                            info!(
+                                "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
+                                _info.inner.node, _info.inner.name, _info.task_id
+                            );
+                        }
+                        let _ = sender.send((runnable, _info.clone()));
+                    }
+                    None => {
+                        if DEBUG && info.inner.name != "main" {
+                            // bz: debug
+                            info!(
+                                "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
+                                info.inner.node, info.inner.name, info.task_id
+                            );
+                        }
+
+                        let _ = sender.send((runnable, info.clone()));
+                    }
                 }
-                let _ = sender.send((runnable, info.clone()));
             })
         };
         runnable.schedule();
@@ -848,7 +927,14 @@ where
     F::Output: 'static,
 {
     let handle = TaskNodeHandle::current();
-    handle.spawn_local(future)
+    // TODO: NOTE: to be able to capture and udpate task id for spawned tasks by a node, i have to add a Option<Arc<TaskInfo>> here
+    // as input parameter, but I did not see this function been triggered yet
+    // tmp give it a None
+    info!(
+        "crate::task::spawn_local()\nbacktrace:\n{}",
+        std::backtrace::Backtrace::force_capture()
+    ); // bz: debug
+    handle.spawn_local(future, None)
 }
 
 /// Runs the provided closure on a thread where blocking is acceptable.
@@ -1359,7 +1445,6 @@ impl Receiver {
         let mut queue = self.inner.queue.lock().unwrap();
         if !queue.is_empty() {
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            // tracing::info!("rand idx = {:?} with queue.len = {:?}", idx, queue.len()); // bz: debug
             Ok(queue.swap_remove(idx))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
@@ -1373,22 +1458,22 @@ impl Receiver {
         &self,
         rng: &GlobalRng,
     ) -> Result<(Runnable, Arc<TaskInfo>), TryRecvError> {
-        // tracing::info!("i am in mpsce.rs"); // bz: debug
         let mut queue = self.inner.queue.lock().unwrap();
         if !queue.is_empty() {
             let handle = runtime::Handle::current();
             let mut order = handle.task.order.lock().unwrap();
             if order.len() > 0 {
-                let line = "~~~~~".repeat(15);
-                info!("{}", line);
-
                 let release = get_release();
-                info!(
-                    "try_simple_schedule: #queue = {:?} #order = {:?} #release = {:?}",
-                    queue.len(),
-                    order.len(),
-                    release,
-                );
+
+                if DEBUG {
+                    info!("{}", "~~~~~".repeat(15));
+                    info!(
+                        "try_simple_schedule: #queue = {:?} #order = {:?} #release = {:?}",
+                        queue.len(),
+                        order.len(),
+                        release,
+                    );
+                }
 
                 if release {
                     // bz: we return yield tasks in reverse order firstly
@@ -1397,14 +1482,15 @@ impl Receiver {
                             // bz: find which idx in queue is the last element in order
                             let (_, info) = e;
                             if last.task_id == info.task_id {
-                                info!(
-                                    "try_simple_schedule: PICK YIELD TASK with idx = {:?}",
-                                    last.task_id
-                                );
-                                info!("{}", line);
-                                drop(order);
+                                if DEBUG {
+                                    info!(
+                                        "try_simple_schedule: PICK YIELD TASK with idx = {:?}",
+                                        last.task_id
+                                    );
+                                    info!("{}", "~~~~~".repeat(15));
+                                }
 
-                                // handle.task.remove_from_order(last);
+                                drop(order);
                                 return Ok(queue.swap_remove(idx));
                             }
                         }
@@ -1417,38 +1503,44 @@ impl Receiver {
                 }
 
                 // bz: random choose one task, but make sure do not release yield tasks
-                let mut it_order = order.iter();
-                let mut it_queue = queue.iter();
-                loop {
-                    match (it_order.next(), it_queue.next()) {
-                        (Some(x), Some(y)) => {
-                            println!("order={}, queue={}", x.task_id, y.1.task_id)
+                for (idx, y) in queue.iter().enumerate() {
+                    let mut found_idx = true;
+                    for x in order.iter() {
+                        match x.task_id == y.1.task_id {
+                            true => {
+                                if DEBUG {
+                                    println!("order={}, queue={}", x.task_id, y.1.task_id);
+                                }
+                                found_idx = false;
+                                break;
+                            }
+                            false => {
+                                if DEBUG {
+                                    println!("queue={}, no matching in order", y.1.task_id);
+                                }
+                            }
                         }
-                        (Some(x), None) => {
-                            println!("order={}, no matching queue", x.task_id)
-                        }
-                        (None, Some(y)) => {
-                            println!("queue={}, no matching order", y.1.task_id);
-                            // bz: tmp return this TODO: random this selection
-                            let idx = queue
-                                .iter()
-                                .position(|r| r.1.task_id == y.1.task_id)
-                                .unwrap();
+                    }
+                    if found_idx {
+                        // bz: tmp return this TODO: random this selection
+                        if DEBUG {
                             info!(
                                 "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
-                                y.1.task_id
+                                queue[idx].1.task_id
                             );
-                            info!("{}", line);
-                            drop(order);
-
-                            return Ok(queue.swap_remove(idx));
+                            info!("{}", "~~~~~".repeat(15));
                         }
-                        (None, None) => break,
+
+                        drop(order);
+                        return Ok(queue.swap_remove(idx));
                     }
                 }
 
-                info!("try_simple_schedule: PICK RANDOM NON-YIELD TASK -> cannot find");
-                info!("{}", line);
+                if DEBUG {
+                    info!("try_simple_schedule: PICK RANDOM NON-YIELD TASK -> cannot find");
+                    info!("{}", "~~~~~".repeat(15));
+                }
+
                 // bz: cannot find any task in queue that is not in order
                 return Ok(queue.swap_remove(0));
 
@@ -1462,7 +1554,7 @@ impl Receiver {
                 //     "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
                 //     info.1.task_id
                 // );
-                // info!("{}", line);
+                // info!("{}", "~~~~~".repeat(15));
                 // drop(order);
 
                 // return Ok(queue.swap_remove(idx));
@@ -1471,7 +1563,11 @@ impl Receiver {
 
             // bz: randomly choose one task, since RELEASE = false or order.len() == 0
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            info!("try_simple_schedule: RANDOM TASK with idx = {:?}", idx);
+
+            if DEBUG {
+                info!("try_simple_schedule: RANDOM TASK with idx = {:?}", idx);
+            }
+
             Ok(queue.swap_remove(idx))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
