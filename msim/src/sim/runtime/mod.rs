@@ -310,6 +310,15 @@ impl Handle {
     /// - All tasks spawned on this node will be killed immediately.
     /// - All data that has not been flushed to the disk will be lost.
     pub fn kill(&self, id: NodeId) {
+        // // bz: before deleting a node, let's make sure there is no yield tasks from this node 
+        // let len_order = self.task.size_of_order();
+        // if len_order > 0 {
+        //     tracing::info!("handle going to kill this node with {:?}", id);
+        //     self.pause(id);
+        //     self.task.push_paused_node_id(id);
+        //     return;
+        // }
+
         self.task.kill(id);
         for sim in self.sims.lock().unwrap().values() {
             sim.reset_node(id);
@@ -327,6 +336,15 @@ impl Handle {
     /// Kill all tasks and delete the node.
     pub fn delete_node(&self, id: NodeId) {
         debug!("delete_node {id}");
+        // // bz: before deleting a node, let's make sure there is no yield tasks from this node 
+        // let len_order = self.task.size_of_order();
+        // if len_order > 0 {
+        //     tracing::info!("handle going to delete this node with {:?}", id);
+        //     self.pause(id);
+        //     self.task.push_paused_node_id(id);
+        //     return;
+        // }
+
         self.task.delete_node(id);
         for sim in self.sims.lock().unwrap().values() {
             sim.delete_node(id);
