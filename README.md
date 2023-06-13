@@ -97,11 +97,15 @@ Currently, the scheduler only works when there is only one `instrumented_yield()
   * in `instrumented_yield()`, we record the task has been yield and store to `order`
   * in `YieldToScheduler::poll()`, we collect the corresponding yield taskinfo, waker and backtrace that has been just yielded in `instrumented_yield()`; the reason of why we have to collect the info here is because the waker is only available here under context
   * we count the number of called `instrumented_yield().await` from source code (i.e., increment `PASSED_INSTRUMENTED_YIELDS`); at the beginning of test, we randomly pick a number (i.e., `THRESHOLD`); whenever we have seen `THRESHOLD` of calls of `instrumented_yield().await`, we set `RELEASE` to true, wake all the yield tasks and send them to `Executor::run_all_ready()`
+    - we might random a large number of `THRESHOLD` and we actually do not have that many yield tasks; if so, we release all yielded tasks in their reverse order in the loop of `Executor::block_on()`
+  * the tasks are stored in two `channel`s: one for tasks from non-yield nodes, one for tasks from yield nodes (i.e., chosen by )
   * the next task is picked by `Receiver::try_simple_schedule()`: 
     - when there is no element in `order` or `RELEASE == false`, we randomly pick a task and return it to executor
     - when `RELEASE == true`, we return the yield tasks in their reverse order in `order`
     - when there are elements in `order` but `RELEASE == false`, we randomly pick a task that is not in `order` and return it to executor
-  * ?? during the waiting of release flag, other nodes might get deleted or killed by `Handle` 
+  * during the waiting of release flag, other nodes might get deleted or killed by `Handle`; we pause those nodes, and resume their kills/deletes after executing yield tasks and returning to `Executor::block_on()`
+- currently, we randomly choose a node to yield all its tasks; the chosen node id is `yield_node_id` in `TaskHandle`
+- currently, for a task with two and more calls of `instrumented_yield()`, we randomly pick a task for those we have seen more than once
 
 - NOTE: the code below `channel()` in `msim/src/sim/task.rs` should be in a separate file, however, we have to use the crate-private trait `TaskInfo` and for convenience of accessing the above fields, we put them in the `task.rs` file
 

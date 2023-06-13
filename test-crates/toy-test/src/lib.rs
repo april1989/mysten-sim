@@ -8,6 +8,13 @@ mod test {
     use jsonrpsee::server::{RpcModule, ServerBuilder};
     use msim::tracing::info;
     use msim::task::instrumented_yield;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+
+
+    static FLAG: AtomicU64 = AtomicU64::new(0); // flag: should be updated by run_server() as the order of when it has been called
 
     pub async fn run_server() -> anyhow::Result<SocketAddr> {
         let server = ServerBuilder::default()
@@ -18,22 +25,20 @@ mod test {
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
         let addr = server.local_addr()?;
-        // let handle = server.start(module)?;
+        let handle = server.start(module)?;
 
         info!("starting validator node server handler 0 ... ");
         tokio::time::sleep(Duration::from_secs(2)).await;
+
+        FLAG.fetch_add(1, Ordering::SeqCst);
         
-        // // In this example we don't care about doing shutdown so let's it run forever.
-        // // You may use the `ServerHandle` to shut it down or manage it yourself.
-        // tokio::spawn(handle.stopped());
-
-        // // we kill this server at the end
-        // if !handle.is_stopped() {
-        //     info!("i am running 0");
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        // }
-
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        // In this example we don't care about doing shutdown so let's it run forever.
+        // You may use the `ServerHandle` to shut it down or manage it yourself.
+        tokio::spawn(handle.stopped());
+
+        instrumented_yield().await; // 2nd call in the same task
 
         info!("i am awake 0");
 
@@ -49,22 +54,20 @@ mod test {
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
         let addr = server.local_addr()?;
-        // let handle = server.start(module)?;
+        let handle = server.start(module)?;
 
         info!("starting validator node server handler 1 ... ");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // // In this example we don't care about doing shutdown so let's it run forever.
-        // // You may use the `ServerHandle` to shut it down or manage it yourself.
-        // tokio::spawn(handle.stopped());
-
-        // // we kill this server at the end
-        // if !handle.is_stopped() {
-        //     info!("i am running 1");
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        // }
+        FLAG.fetch_add(1, Ordering::SeqCst);
 
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        assert!(FLAG.load(Ordering::SeqCst) == 1, "panic: FLAG != 1"); // in order to trigger error
+
+        // In this example we don't care about doing shutdown so let's it run forever.
+        // You may use the `ServerHandle` to shut it down or manage it yourself.
+        tokio::spawn(handle.stopped());
 
         info!("i am awake 1");
 
@@ -80,22 +83,18 @@ mod test {
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
         let addr = server.local_addr()?;
-        // let handle = server.start(module)?;
+        let handle = server.start(module)?;
 
         info!("starting validator node server handler 2 ... ");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // // In this example we don't care about doing shutdown so let's it run forever.
-        // // You may use the `ServerHandle` to shut it down or manage it yourself.
-        // tokio::spawn(handle.stopped());
-
-        // // we kill this server at the end
-        // if !handle.is_stopped() {
-        //     info!("i am running 2");
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        // }
+        FLAG.fetch_add(1, Ordering::SeqCst);
 
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        // In this example we don't care about doing shutdown so let's it run forever.
+        // You may use the `ServerHandle` to shut it down or manage it yourself.
+        tokio::spawn(handle.stopped());
 
         info!("i am awake 2");
 
@@ -111,22 +110,18 @@ mod test {
         module.register_method("validator method", |_, _| Ok("lo"))?;
 
         let addr = server.local_addr()?;
-        // let handle = server.start(module)?;
+        let handle = server.start(module)?;
 
         info!("starting validator node server handler 3 ... ");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // // In this example we don't care about doing shutdown so let's it run forever.
-        // // You may use the `ServerHandle` to shut it down or manage it yourself.
-        // tokio::spawn(handle.stopped());
-
-        // // we kill this server at the end
-        // if !handle.is_stopped() {
-        //     info!("i am running 3");
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        // }
+        FLAG.fetch_add(1, Ordering::SeqCst);
 
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
+
+        // In this example we don't care about doing shutdown so let's it run forever.
+        // You may use the `ServerHandle` to shut it down or manage it yourself.
+        tokio::spawn(handle.stopped());
 
         info!("i am awake 3");
 
@@ -180,22 +175,23 @@ mod test {
         });
 
         // wait til node fully started and enter the instrument_yield()
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
         instrumented_yield().await; // assume we have a fail_point here replaced by instrumented_yield
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         info!("in test_toy waiting.");
 
         // kill the jsonrpsee server node
         msim::runtime::Handle::current().kill(node.id());
         msim::runtime::Handle::current().kill(node2.id());
+        
     }
 }

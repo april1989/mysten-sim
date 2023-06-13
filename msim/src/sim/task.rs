@@ -25,6 +25,7 @@ use std::{
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
+    thread::sleep,
     time::Duration,
 };
 
@@ -43,6 +44,9 @@ pub(crate) struct Executor {
     rand: GlobalRng,
     time: TimeRuntime,
     time_limit: Option<Duration>,
+
+    // bz: queue for yield tasks
+    yield_queue: Receiver,
 }
 
 /// A unique identifier for a task.
@@ -185,6 +189,13 @@ impl TaskInfo {
     }
 }
 
+impl PartialEq for TaskInfo {
+    fn eq(&self, other: &TaskInfo) -> bool {
+        self.task_id == other.task_id
+    }
+}
+impl Eq for TaskInfo {}
+
 // // Instrumentation to capture the stack trace of points of interest in the code.
 // // Code can call `instrumented_yield` to allow the scheduler to see the stack trace
 // // of the task that just yielded.
@@ -192,8 +203,10 @@ impl TaskInfo {
 //     static LAST_CAPTURE: Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>> = Mutex::new(None);
 // }
 
-// bz: flags
-const DEBUG: bool = true; // DEBUG = true: print out necessary debug info
+/// bz: flags
+
+/// bz: DEBUG = true: print out necessary debug info
+pub const DEBUG: bool = true;
 const DEBUG_DETAIL: bool = false; // DEBUG_DETAIL = true: print out all debug info, this can be super long
 
 static RELEASE: AtomicBool = AtomicBool::new(false); // bz: flag of whether it is the time to release yield tasks
@@ -435,7 +448,7 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
             // we randomly pick a node to yield all its tasks
             let rng = handle.rand;
             let nodes = handle.task.nodes.lock().unwrap();
-            let node_idx = rng.with(|rng| rng.gen_range(2..nodes.keys().len())); // 0 is main, 1 is client
+            let node_idx = rng.with(|rng| rng.gen_range(2..nodes.keys().len() + 1)); // 0 is main, 1 is client
             drop(nodes);
 
             handle
@@ -485,6 +498,7 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
 impl Executor {
     pub fn new(rand: GlobalRng) -> Self {
         let (sender, queue) = channel();
+        let (yield_sender, yield_queue) = channel();
         Executor {
             queue,
             handle: TaskHandle {
@@ -500,6 +514,7 @@ impl Executor {
             time: TimeRuntime::new(&rand),
             rand,
             time_limit: None,
+            yield_queue,
         }
     }
 
@@ -526,21 +541,23 @@ impl Executor {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
                 let len_order = self.handle.size_of_order();
-                if len_order > 0 {
+                let release = get_release();
+                if len_order > 0 && !release {
                     // bz: we still have yield tasks, let them be ready
                     if DEBUG {
                         info!("RELEASE ready (due to poll ready in executor, but still has yield tasks).");
                     }
                     self.handle.set_release_and_wake_last_captures();
-                    continue;
+
+                    self.run_all_ready(); // bz: last round of call
                 }
 
                 if DEBUG {
                     info!("executor: done");
                 }
 
-                // // bz: resume the paused kill/delete node tasks
-                // self.handle.resume_paused_node_id();
+                // bz: resume the paused kill/delete node tasks
+                self.handle.resume_paused_node_id();
 
                 return val;
             }
@@ -574,6 +591,17 @@ impl Executor {
         task
     }
 
+    /// bz: pick a yield/non-yield task
+    fn pick_task(&self) -> Result<Option<(Runnable, Arc<TaskInfo>)>, TryRecvError> {
+        let release = get_release();
+        let len_order = self.handle.size_of_order();
+        if release && len_order > 0 {
+            return self.yield_queue.try_recv_yield(&self.rand);
+        } else {
+            return self.queue.try_recv_random(&self.rand);
+        }
+    }
+
     /// Drain all tasks from ready queue and run them.
     fn run_all_ready(&self) {
         let hook_guard = Arc::new(PanicHookGuard::new());
@@ -591,10 +619,12 @@ impl Executor {
         }));
 
         let mut trys: u64 = 0;
-        // while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
-        // while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
-        while let Ok(ret) = self.queue.try_simple_schedule(&self.rand) {
+        // // while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
+        // // while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
+        // while let Ok(ret) = self.queue.try_simple_schedule(&self.rand) {
+        while let Ok(ret) = self.pick_task() {
             if ret.is_none() {
+                // TODO: bz: this seems like it has never been called
                 if trys >= RETRY_PICK_LIMIT {
                     // bz: assume no more non-yield tasks can be executed anymore, let yield tasks get ready
                     if DEBUG {
@@ -723,6 +753,9 @@ pub(crate) struct TaskHandle {
     order: Arc<Mutex<Vec<Arc<TaskInfo>>>>,
     last_captures: Arc<Mutex<Vec<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>>,
 
+    // bz: sender of yield tasks
+    yield_sender: Sender,
+
     // bz: record paused node id
     paused_node_id: Arc<Mutex<Vec<Arc<NodeId>>>>,
 }
@@ -740,6 +773,22 @@ impl TaskHandle {
     pub fn size_of_order(&self) -> usize {
         let order = self.order.lock().unwrap();
         return order.len();
+    }
+
+    /// bz: true if a task is in order
+    pub fn is_in_order(&self, info: Arc<TaskInfo>) -> bool {
+        let order = self.order.lock().unwrap();
+        for x in order.iter() {
+            match x.task_id == info.task_id {
+                true => {
+                    return true;
+                }
+                false => {
+                    continue;
+                }
+            }
+        }
+        return false;
     }
 
     /// bz: wake all in last_captures
@@ -775,7 +824,7 @@ impl TaskHandle {
         self.wake_last_captures();
     }
 
-    /// bz: push paused node id to paused_node_id 
+    /// bz: push paused node id to paused_node_id
     pub fn push_paused_node_id(&self, id: NodeId) {
         let mut paused_node_id = self.paused_node_id.lock().unwrap();
         paused_node_id.push(id.into());
@@ -802,7 +851,7 @@ impl TaskHandle {
         let mut nodes = self.nodes.lock().unwrap();
         let node = nodes.get_mut(&id).expect("node not found");
         node.paused.clear();
-        
+
         if DEBUG_DETAIL {
             info!(
                 "killing task: with node id {:?}, name {:?}, task id {:?}",
@@ -811,7 +860,7 @@ impl TaskHandle {
                 *node.info.task_id
             );
         }
-        
+
         let new_info = Arc::new(TaskInfo::new(id, *node.info.task_id, node.info.name()));
         let old_info = std::mem::replace(&mut node.info, new_info);
         old_info.killed.send_replace(true);
@@ -828,6 +877,7 @@ impl TaskHandle {
             init(&TaskNodeHandle {
                 sender: self.sender.clone(),
                 info: node.info.clone(),
+                yield_sender: self.yield_sender.clone(),
             });
         }
     }
@@ -873,6 +923,7 @@ impl TaskHandle {
         let handle = TaskNodeHandle {
             sender: self.sender.clone(),
             info: info.clone(),
+            yield_sender: self.yield_sender.clone(),
         };
         if let Some(init) = &init {
             init(&handle);
@@ -899,6 +950,7 @@ impl TaskHandle {
         Some(TaskNodeHandle {
             sender: self.sender.clone(),
             info,
+            yield_sender: self.yield_sender.clone(),
         })
     }
 }
@@ -907,6 +959,7 @@ impl TaskHandle {
 pub(crate) struct TaskNodeHandle {
     sender: Sender,
     info: Arc<TaskInfo>,
+    yield_sender: Sender, // bz:
 }
 
 assert_send_sync!(TaskNodeHandle);
@@ -919,7 +972,12 @@ impl TaskNodeHandle {
     pub fn try_current() -> Option<Self> {
         let info = crate::context::try_current_task()?;
         let sender = crate::context::try_current(|h| h.task.sender.clone())?;
-        Some(TaskNodeHandle { sender, info })
+        let yield_sender = crate::context::try_current(|h| h.task.yield_sender.clone())?;
+        Some(TaskNodeHandle {
+            sender,
+            info,
+            yield_sender,
+        })
     }
 
     pub(crate) fn id(&self) -> NodeId {
@@ -963,6 +1021,7 @@ impl TaskNodeHandle {
         F::Output: 'static,
     {
         let sender = self.sender.clone();
+        let yield_sender = self.yield_sender.clone();
         let info = self.info.clone();
         let mut killed_rx = info.killed.subscribe();
 
@@ -999,17 +1058,30 @@ impl TaskNodeHandle {
                 // );
                 match &new_info {
                     Some(_info) => {
-                        if DEBUG_DETAIL && _info.inner.name != "main" {
-                            // bz: debug
-                            info!(
-                                "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
-                                _info.inner.node, _info.inner.name, _info.task_id
-                            );
+                        // bz: from newly created tasks or resume pending tasks
+                        let handle = runtime::Handle::current();
+                        if handle.task.is_in_order(_info.clone()) {
+                            if DEBUG_DETAIL {
+                                // bz: debug
+                                info!(
+                                    "-> send in TaskNodeHandle (yield_sender): node id {:?}, name {:?}, task id {:?}",
+                                    _info.inner.node, _info.inner.name, _info.task_id
+                                );
+                            }
+                            let _ = yield_sender.send((runnable, _info.clone()));
+                        } else {
+                            if DEBUG_DETAIL && _info.inner.name != "main" {
+                                // bz: debug
+                                info!(
+                                    "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
+                                    _info.inner.node, _info.inner.name, _info.task_id
+                                );
+                            }
+                            let _ = sender.send((runnable, _info.clone()));
                         }
-
-                        let _ = sender.send((runnable, _info.clone()));
                     }
                     None => {
+                        // bz: from create_node()
                         if DEBUG_DETAIL && info.inner.name != "main" {
                             // bz: debug
                             info!(
@@ -1599,11 +1671,22 @@ impl Receiver {
     pub fn try_recv_random(
         &self,
         rng: &GlobalRng,
-    ) -> Result<(Runnable, Arc<TaskInfo>), TryRecvError> {
+    ) -> Result<Option<(Runnable, Arc<TaskInfo>)>, TryRecvError> {
         let mut queue = self.inner.queue.lock().unwrap();
+
+        if DEBUG_DETAIL {
+            info!("{}", "~~~~~".repeat(15));
+            info!(
+                "try_recv_random: #queue = {:?} #release = {:?}",
+                queue.len(),
+                RELEASE,
+            );
+            info!("{}", "~~~~~".repeat(15));
+        }
+
         if !queue.is_empty() {
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            Ok(queue.swap_remove(idx))
+            Ok(Some(queue.swap_remove(idx)))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
         } else {
@@ -1611,8 +1694,8 @@ impl Receiver {
         }
     }
 
-    /// bz: a simplest try: we send the tasks back in a reverse order of Executor.handle.order
-    pub fn try_simple_schedule(
+    /// bz: we send the yield tasks back in a reverse order of Executor.handle.order
+    pub fn try_recv_yield(
         &self,
         rng: &GlobalRng,
     ) -> Result<Option<(Runnable, Arc<TaskInfo>)>, TryRecvError> {
@@ -1620,82 +1703,58 @@ impl Receiver {
         if !queue.is_empty() {
             let handle = runtime::Handle::current();
             let len_order = handle.task.size_of_order();
-            if len_order == 0 {
-                // bz: randomly choose one task, since RELEASE = false or order.len() == 0
-                let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-
-                if DEBUG_DETAIL {
-                    info!("try_simple_schedule: RANDOM TASK with idx = {:?}", idx);
-                }
-
-                return Ok(Some(queue.swap_remove(idx)));
-            }
-
-            let release = get_release();
 
             if DEBUG {
                 info!("{}", "~~~~~".repeat(15));
                 info!(
-                    "try_simple_schedule: #queue = {:?} #order = {:?} #release = {:?}",
+                    "try_recv_yield: #queue = {:?} #order = {:?} #release = {:?}",
                     queue.len(),
                     len_order,
-                    release,
+                    RELEASE,
                 );
             }
 
-            let mut order = handle.task.order.lock().unwrap();
-            if release {
-                // bz: we return yield tasks in reverse order firstly
-                if let Some(last) = order.pop() {
-                    for (idx, e) in queue.iter().enumerate() {
-                        // bz: find which idx in queue is the last element in order
-                        let (_, info) = e;
-                        if last.task_id == info.task_id {
-                            if DEBUG {
-                                info!(
-                                    "try_simple_schedule: PICK YIELD TASK with idx = {:?}",
-                                    last.task_id
-                                );
-                                info!("{}", "~~~~~".repeat(15));
-                            }
+            assert!(
+                len_order > 0,
+                "try_recv_yield: the order should not be empty."
+            );
 
-                            drop(order);
-                            return Ok(Some(queue.swap_remove(idx)));
+            let handle = runtime::Handle::current();
+            let mut order = handle.task.order.lock().unwrap();
+
+            // bz: we return yield tasks in reverse order firstly
+            if let Some(last) = order.pop() {
+                for (idx, e) in queue.iter().enumerate() {
+                    // bz: find which idx in queue is the last element in order
+                    let (_, info) = e;
+                    if last == info.clone() {
+                        if DEBUG {
+                            info!(
+                                "try_recv_yield: PICK YIELD TASK with idx = {:?}",
+                                last.task_id
+                            );
+                            info!("{}", "~~~~~".repeat(15));
                         }
+
+                        drop(order);
+                        return Ok(Some(queue.swap_remove(idx)));
                     }
                 }
-
-                assert!(
-                    true,
-                    "panic in try_simple_schedule: should not come to this point."
-                )
             }
 
-            // bz: random choose one task, but make sure do not release yield tasks
-            for (idx, y) in queue.iter().enumerate() {
-                let mut found_idx = true;
-                for x in order.iter() {
-                    match x.task_id == y.1.task_id {
-                        true => {
-                            if DEBUG_DETAIL {
-                                info!("order={}, queue={}", x.task_id, y.1.task_id);
-                            }
-                            found_idx = false;
-                            break;
-                        }
-                        false => {
-                            if DEBUG_DETAIL {
-                                info!("queue={}, no matching in order", y.1.task_id);
-                            }
-                        }
-                    }
-                }
-                if found_idx {
-                    // bz: tmp return this TODO: random this selection
+            // bz: when we have multiple calls of instrumented_yield()
+            // randomly pick a yield task from order
+            // TODO: better solution
+            let idx = rng.with(|rng| rng.gen_range(0..order.len()));
+            let pick = order.remove(idx);
+            for (idx, e) in queue.iter().enumerate() {
+                // bz: find which idx in queue is the last element in order
+                let (_, info) = e;
+                if pick == info.clone() {
                     if DEBUG {
                         info!(
-                            "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
-                            queue[idx].1.task_id
+                            "try_recv_yield: RABDOMLY PICK YIELD TASK with idx = {:?}",
+                            pick.task_id
                         );
                         info!("{}", "~~~~~".repeat(15));
                     }
@@ -1704,21 +1763,124 @@ impl Receiver {
                     return Ok(Some(queue.swap_remove(idx)));
                 }
             }
-            drop(order);
 
-            // bz: cannot find any task in queue that is not in order
-            if DEBUG {
-                info!("try_simple_schedule: PICK RANDOM NON-YIELD TASK -> cannot find any task in queue that is not in order.");
-                info!("{}", "~~~~~".repeat(15));
-            }
-
-            return Ok(None);
+            panic!("panic in try_recv_yield: should not come to this point.");
+            
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
         }
     }
+
+    // /// bz: a simplest try: we send the tasks back in a reverse order of Executor.handle.order
+    // pub fn try_simple_schedule(
+    //     &self,
+    //     rng: &GlobalRng,
+    // ) -> Result<Option<(Runnable, Arc<TaskInfo>)>, TryRecvError> {
+    //     let mut queue = self.inner.queue.lock().unwrap();
+    //     if !queue.is_empty() {
+    //         let handle = runtime::Handle::current();
+    //         let len_order = handle.task.size_of_order();
+    //         if len_order == 0 {
+    //             // bz: randomly choose one task, since RELEASE = false or order.len() == 0
+    //             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
+
+    //             if DEBUG_DETAIL {
+    //                 info!("try_simple_schedule: RANDOM TASK with idx = {:?}", idx);
+    //             }
+
+    //             return Ok(Some(queue.swap_remove(idx)));
+    //         }
+
+    //         let release = get_release();
+
+    //         if DEBUG {
+    //             info!("{}", "~~~~~".repeat(15));
+    //             info!(
+    //                 "try_simple_schedule: #queue = {:?} #order = {:?} #release = {:?}",
+    //                 queue.len(),
+    //                 len_order,
+    //                 release,
+    //             );
+    //         }
+
+    //         let mut order = handle.task.order.lock().unwrap();
+    //         if release {
+    //             // bz: we return yield tasks in reverse order firstly
+    //             if let Some(last) = order.pop() {
+    //                 for (idx, e) in queue.iter().enumerate() {
+    //                     // bz: find which idx in queue is the last element in order
+    //                     let (_, info) = e;
+    //                     if last.task_id == info.task_id {
+    //                         if DEBUG {
+    //                             info!(
+    //                                 "try_simple_schedule: PICK YIELD TASK with idx = {:?}",
+    //                                 last.task_id
+    //                             );
+    //                             info!("{}", "~~~~~".repeat(15));
+    //                         }
+
+    //                         drop(order);
+    //                         return Ok(Some(queue.swap_remove(idx)));
+    //                     }
+    //                 }
+    //             }
+
+    //             assert!(
+    //                 true,
+    //                 "panic in try_simple_schedule: should not come to this point."
+    //             )
+    //         }
+
+    //         // bz: random choose one task, but make sure do not release yield tasks
+    //         for (idx, y) in queue.iter().enumerate() {
+    //             let mut found_idx = true;
+    //             for x in order.iter() {
+    //                 match x.task_id == y.1.task_id {
+    //                     true => {
+    //                         if DEBUG_DETAIL {
+    //                             info!("order={}, queue={}", x.task_id, y.1.task_id);
+    //                         }
+    //                         found_idx = false;
+    //                         break;
+    //                     }
+    //                     false => {
+    //                         if DEBUG_DETAIL {
+    //                             info!("queue={}, no matching in order", y.1.task_id);
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //             if found_idx {
+    //                 // bz: tmp return this TODO: random this selection
+    //                 if DEBUG {
+    //                     info!(
+    //                         "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
+    //                         queue[idx].1.task_id
+    //                     );
+    //                     info!("{}", "~~~~~".repeat(15));
+    //                 }
+
+    //                 drop(order);
+    //                 return Ok(Some(queue.swap_remove(idx)));
+    //             }
+    //         }
+    //         drop(order);
+
+    //         // bz: cannot find any task in queue that is not in order
+    //         if DEBUG {
+    //             info!("try_simple_schedule: PICK RANDOM NON-YIELD TASK -> cannot find any task in queue that is not in order.");
+    //             info!("{}", "~~~~~".repeat(15));
+    //         }
+
+    //         return Ok(None);
+    //     } else if Arc::weak_count(&self.inner) == 0 {
+    //         Err(TryRecvError::Disconnected)
+    //     } else {
+    //         Err(TryRecvError::Empty)
+    //     }
+    // }
 
     /// clear
     pub fn clear_inner(&self) {
