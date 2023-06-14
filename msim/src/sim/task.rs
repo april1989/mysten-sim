@@ -213,8 +213,6 @@ static RELEASE: AtomicBool = AtomicBool::new(false); // bz: flag of whether it i
 static THRESHOLD: AtomicU64 = AtomicU64::new(9); // bz: we can random this number; whenever we have seen PASSED_INSTRUMENTED_YIELDS of calls of instrumented_yield().await, we set RELEASE to true
 static PASSED_INSTRUMENTED_YIELDS: AtomicU64 = AtomicU64::new(0); // bz: how many calls of instrumented_yield().await we have seen
 
-static RETRY_PICK_LIMIT: u64 = 2; // bz: the number limit of retrying to pick a non-yield task in executor, we should not need lock here
-
 /// bz: set RELEASE to true
 pub fn set_release_to_true() {
     RELEASE.store(true, Ordering::SeqCst);
@@ -509,6 +507,7 @@ impl Executor {
                 order: Arc::new(Mutex::new(Vec::new())),
                 last_captures: Arc::new(Mutex::new(Vec::new())),
                 yield_node_id: Arc::new(AtomicU64::new(0)),
+                yield_sender,
                 paused_node_id: Arc::new(Mutex::new(Vec::new())),
             },
             time: TimeRuntime::new(&rand),
@@ -618,31 +617,17 @@ impl Executor {
             }
         }));
 
-        let mut trys: u64 = 0;
         // // while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
         // // while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
         // while let Ok(ret) = self.queue.try_simple_schedule(&self.rand) {
         while let Ok(ret) = self.pick_task() {
             if ret.is_none() {
+                // bz: assume no more non-yield tasks can be executed anymore, let yield tasks get ready
                 // TODO: bz: this seems like it has never been called
-                if trys >= RETRY_PICK_LIMIT {
-                    // bz: assume no more non-yield tasks can be executed anymore, let yield tasks get ready
-                    if DEBUG {
-                        info!("RELEASE ready (due to long waiting and no more non-yield tasks to execute).")
-                    }
-                    self.handle.set_release_and_wake_last_captures();
-                    continue;
-                }
-
-                // bz: cannot find any task in queue that is not in order, we wait for a while and retry
-                trys += 1;
                 if DEBUG {
-                    info!(
-                        "executor waits for 1 second and retry the {:?} time ...",
-                        trys
-                    );
+                    info!("RELEASE ready (due to long waiting and no more non-yield tasks to execute).")
                 }
-                sleep(Duration::from_secs(1));
+                self.handle.set_release_and_wake_last_captures();
                 continue;
             }
 
@@ -1765,7 +1750,6 @@ impl Receiver {
             }
 
             panic!("panic in try_recv_yield: should not come to this point.");
-            
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
         } else {
