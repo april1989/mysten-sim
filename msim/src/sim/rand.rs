@@ -269,7 +269,7 @@ mod tests {
         let mut seqs = BTreeSet::new();
         for i in 0..9 {
             let seq = std::thread::spawn(move || {
-                let runtime = Runtime::with_seed_and_config(i / 3, crate::SimConfig::default());
+                let runtime = Runtime::with_seed_and_config(i / 3, crate::SimConfig::default(), 0);
                 runtime
                     .block_on(async { (0..10).map(|_| rand::random::<u64>()).collect::<Vec<_>>() })
             })
@@ -285,7 +285,7 @@ mod tests {
         let mut seqs = BTreeSet::new();
         for i in 0..9 {
             let seq = std::thread::spawn(move || {
-                let runtime = Runtime::with_seed_and_config(i / 3, crate::SimConfig::default());
+                let runtime = Runtime::with_seed_and_config(i / 3, crate::SimConfig::default(), 0);
                 runtime.block_on(async {
                     let set = (0..10).map(|i| (i, i)).collect::<HashMap<_, _>>();
                     set.into_iter().collect::<Vec<_>>()

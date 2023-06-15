@@ -33,6 +33,16 @@ RUSTFLAGS="--cfg msim" cargo test
 ```
 
 
+### real scenario in test_create_advance_epoch_tx_race 
+
+reproduce the race test with instrumented_yield:
+
+- we have 4 validator nodes, each node spawns two tasks each called `instrumented_yield()`
+- we only need to yield the two tasks in one validator node, as written in the test
+- how can we panic when entering the safe mode without register fail_point?
+
+
+
 
 ## Implementation
 
@@ -154,26 +164,22 @@ Currently, the scheduler only works when there is only one `instrumented_yield()
 
   * NOTE: uncertain change in `crate::task::spawn_local()`
 
-
-#### Real scenario in test_create_advance_epoch_tx_race 
-
-reproduce the race test with instrumented_yield:
-
-- we have 4 validator nodes, each node spawns two tasks each called `instrumented_yield()`
-- we only need to yield the two tasks in one validator node, as written in the test
-- how can we panic when entering the safe mode without register fail_point?
-
-
-
-
-
-
-
-### debug 
-add code 
-```rust
-tracing::info!( // bz: debug
-    "get backtrace:\n{}",
-    std::backtrace::Backtrace::force_capture()
-);
+- add environtment variable `MSIM_EXHAUSTIVE` to do: (1) firstly run a randome schedule and record all tasks called `instrumented_yield()`, (2) permutate all possible schedules of the tasks and run them all; to try on `toy_test`:
+```shell
+MSIM_EXHAUSTIVE=true RUSTFLAGS="--cfg msim" cargo test
 ```
+
+
+
+
+
+### Insights
+
+- "We observe that threads in correct programs indicate when they are unable to make progress by yielding the processor. A yield is usually indicated by the presence of a sleep operation or a timeout while waiting on a resource." - Fair Stateless Model Checking
+
+
+
+### Next
+
+1. caller/location of where `instrumented_yield()` is called: 
+

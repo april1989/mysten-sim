@@ -25,7 +25,6 @@ use std::{
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
-    thread::sleep,
     time::Duration,
 };
 
@@ -150,6 +149,7 @@ pub struct TaskInfo {
     killed: watch::Sender<bool>,
 
     /// bz: task id
+    /// TODO: now we assume the same task has the same task id in different iterations
     task_id: Arc<TaskId>,
 }
 
@@ -204,14 +204,48 @@ impl Eq for TaskInfo {}
 // }
 
 /// bz: flags
-
-/// bz: DEBUG = true: print out necessary debug info
-pub const DEBUG: bool = true;
+pub const DEBUG: bool = true; // bz: DEBUG = true: print out necessary debug info
 const DEBUG_DETAIL: bool = false; // DEBUG_DETAIL = true: print out all debug info, this can be super long
 
+/// bz: EXHAUSTIVE
+/// instead of storing all schedules of TaskInfo, we permutate the index of the order array
+static EXHAUSTIVE: AtomicBool = AtomicBool::new(false); // bz: enumerate all possible orders of calls of instrumented_yield().await -> to use this, we need to know how many calls are in total
+static TASKS: Mutex<Vec<Arc<TaskInfo>>> = Mutex::new(Vec::new()); // bz: copy of TaskHandle::order
+static CURRENT_SCHEDULE_IDX: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: current schedule idx for this iteration
+
+/// bz: random
 static RELEASE: AtomicBool = AtomicBool::new(false); // bz: flag of whether it is the time to release yield tasks
 static THRESHOLD: AtomicU64 = AtomicU64::new(9); // bz: we can random this number; whenever we have seen PASSED_INSTRUMENTED_YIELDS of calls of instrumented_yield().await, we set RELEASE to true
 static PASSED_INSTRUMENTED_YIELDS: AtomicU64 = AtomicU64::new(0); // bz: how many calls of instrumented_yield().await we have seen
+
+/// bz: reset the static flags for each iteration to default values
+pub fn reset_flags() {
+    if DEBUG {
+        info!("reset flags ... ");
+    }
+    RELEASE.store(false, Ordering::SeqCst);
+    PASSED_INSTRUMENTED_YIELDS.store(0, Ordering::SeqCst);
+    // initial_threshold(); // TODO: bz: handle has not been re-created yet
+}
+
+/// bz: initialize the random value of THRESHOLD
+pub fn initial_threshold() -> u64 {
+    let handle = runtime::Handle::current();
+    let rng = handle.rand;
+    let t: u64 = rng.with(|rng| rng.gen_range(2..20)); // TODO: bz: what is a good estimate here?
+    THRESHOLD.store(t, Ordering::SeqCst);
+
+    if DEBUG {
+        info!("initialize THRESHOLD = {:?}", THRESHOLD);
+    }
+
+    t
+}
+
+/// bz: set EXHAUSTIVE to true
+pub fn set_exhaustive_to_true() {
+    EXHAUSTIVE.store(true, Ordering::SeqCst);
+}
 
 /// bz: set RELEASE to true
 pub fn set_release_to_true() {
@@ -222,6 +256,51 @@ pub fn set_release_to_true() {
 pub fn get_release() -> bool {
     let release = RELEASE.load(Ordering::SeqCst);
     release
+}
+
+/// bz: copy order to TASKS
+fn copy_orders() {
+    if DEBUG {
+        info!("copying all seen tasks ...");
+    }
+
+    let handle = runtime::Handle::current();
+    let order = handle.task.order.lock().unwrap();
+    let mut tasks = TASKS.lock().unwrap();
+    for e in order.iter() {
+        let info = Arc::new(TaskInfo::new(e.node(), *e.task_id, e.name()));
+        tasks.push(info);
+    }
+}
+
+/// bz: size of tasks
+pub fn size_of_tasks() -> usize {
+    let tasks = TASKS.lock().unwrap();
+    tasks.len()
+}
+
+/// bz: set CURRENT_SCHEDULE_IDX
+pub fn set_current_schedule(s: &Vec<usize>) {
+    let mut current = CURRENT_SCHEDULE_IDX.lock().unwrap();
+    for i in s {
+        current.push(*i);
+    }
+    // *current = s;
+    let tasks = TASKS.lock().unwrap();
+    if DEBUG {
+        info!("{}", "#####".repeat(15));
+        info!("current scheldue:");
+        for idx in current.iter() {
+            let e = &tasks[*idx];
+            info!(
+                " - node id {:?}, name {:?}, task id {:?}",
+                e.node(),
+                e.name(),
+                e.task_id
+            );
+        }
+        info!("{}", "#####".repeat(15));
+    }
 }
 
 #[derive(Default)]
@@ -236,191 +315,224 @@ impl Future for YieldToScheduler {
             info!("polling backtrace"); // bz: debug
         }
 
-        let info = context::current_task(); // bz: current task info
-        if DEBUG_DETAIL {
-            info!(
-                // bz: debug
-                "working on task with node id {:?}, name {:?}, task id {:?}",
-                info.node(),
-                info.name(),
-                info.task_id,
-            );
+        let exhaustive = EXHAUSTIVE.load(Ordering::SeqCst);
+        match exhaustive {
+            true => poll_exhaustive(cx),
+            false => poll_random(cx),
         }
-
-        let handle = runtime::Handle::current();
-        let len_order = handle.task.size_of_order();
-        if len_order == 0 {
-            // bz: no pushed yield task yet, or all have been executed
-            if DEBUG_DETAIL {
-                info!("no tasks spawned by the yield node yet");
-                info!("{}", "*****".repeat(15));
-            }
-            return Poll::Ready(());
-        }
-
-        // bz: return ready for non-yield node's tasks
-        let yield_node_id = handle.task.yield_node_id.load(Ordering::SeqCst);
-        if info.node() != NodeId(yield_node_id) {
-            if DEBUG {
-                info!("ready for tasks spawned by non-yield nodes");
-                info!("{}", "*****".repeat(15));
-            }
-            return Poll::Ready(());
-        }
-
-        if get_release() {
-            if DEBUG_DETAIL {
-                // bz: the following if else is for debugging
-                if len_order == 0 {
-                    info!("already send all yield tasks to executor, waiting to run.");
-                } else {
-                    info!("already waked all yield tasks.");
-                }
-                info!("{}", "*****".repeat(15));
-            }
-            return Poll::Ready(());
-        }
-
-        let mut last_captures = handle.task.last_captures.lock().unwrap();
-        let l_last_captures = last_captures.len();
-
-        if DEBUG {
-            info!(
-                "#order = {:?} #last_captures = {:?}",
-                len_order, l_last_captures
-            );
-        }
-
-        let order = handle.task.order.lock().unwrap();
-        let _task_id = &order[len_order - 1].task_id.clone();
-        drop(order); // bz: early drop the lock
-
-        if info.task_id == _task_id.clone() {
-            if l_last_captures == len_order {
-                if DEBUG_DETAIL {
-                    info!("pushed the same task already, got polled again. skip.");
-                }
-            } else if l_last_captures == len_order - 1 {
-                // bz: we havent push this task to last_captures, push now
-                if DEBUG_DETAIL {
-                    info!(
-                        // bz: debug
-                        "pushing task with node id {:?}, name {:?}, task id {:?}",
-                        info.node(),
-                        info.name(),
-                        info.task_id,
-                    );
-                }
-                let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
-                last_captures.push(new_capture);
-
-                if DEBUG_DETAIL {
-                    info!("#last_captures = {:?} (after push)", last_captures.len());
-                }
-            }
-        }
-        drop(last_captures);
-
-        // bz: we initialize it with a random number
-        let mut threshold = THRESHOLD.load(Ordering::SeqCst);
-        if threshold == 0 {
-            let rng = handle.rand;
-            let t: u64 = rng.with(|rng| rng.gen_range(2..20)); // TODO: bz: what is a good estimate here?
-            THRESHOLD.store(t, Ordering::SeqCst);
-            threshold = t;
-
-            if DEBUG {
-                info!("initialize THRESHOLD = {:?}", THRESHOLD);
-            }
-        }
-
-        // bz: check if its time to release yield tasks
-        let n = PASSED_INSTRUMENTED_YIELDS.load(Ordering::SeqCst);
-        if n >= threshold {
-            if DEBUG {
-                info!("Reached THRESHOLD = {:?}", threshold);
-                info!("RELEASE ready (due to reaching THRESHOLD).");
-                info!("{}", "*****".repeat(15));
-            }
-
-            set_release_to_true();
-            return Poll::Ready(());
-        }
-
-        // // bz: check if we already pushed and pending on this task
-        // for (i, e) in order.iter().enumerate() {
-        //     info!(
-        //         // bz: debug
-        //         "checking task with node id {:?}, name {:?}, task id {:?}",
-        //         e.node(),
-        //         e.name(),
-        //         e.task_id,
-        //     );
-        //     if info.task_id == e.task_id {
-        //         info!("instrumented_yield() called twice before control returned to scheduler");
-        //         // TODO: bz: we seen the second instrumented_yield() in the same task
-        //         return Poll::Ready(());
-        //     }
-        // }
-
-        if DEBUG_DETAIL {
-            info!("{}", "*****".repeat(15));
-        }
-
-        Poll::Pending
-
-        // // capture the current stack trace
-        // LAST_CAPTURE.with(|last_capture| {
-        //     let mut last_capture = last_capture.lock().unwrap();
-        //     match (&self.0, last_capture.as_ref()) {
-        //         (Some(this), Some(last)) => {
-        //             assert!(Arc::ptr_eq(this, last));
-        //             // we were polled again before control reached the scheduler
-        //             info!("YieldToScheduler polled before being woken");
-        //             Poll::Pending
-        //         }
-        //         (Some(_), None) => {
-        //             // the scheduler cleared the capture, so we are ready to resume.
-        //             info!("poll ready");
-        //             Poll::Ready(())
-        //             // Poll::Pending
-        //         }
-        //         (None, Some(_)) => {
-        //             // If this happens and can't be avoided, we could keep a Vec instead of Option
-        //             // in LAST_CAPTURE, although the scheduler will have no ability to change the
-        //             // ordering of such events.
-        //             info!("poll panic");
-        //             panic!(
-        //                 "instrumented_yield() called twice before control returned to scheduler"
-        //             );
-        //         }
-        //         (None, None) => {
-        //             info!("add to LAST_CAPTURE");
-        //             trace!("capturing stack trace and yielding");
-        //             let info = context::current_task();
-        //             let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
-        //             *last_capture = Some(new_capture.clone());
-        //             self.0 = Some(new_capture);
-        //             Poll::Pending
-        //         }
-        //     }
-        // })
     }
 }
 
-/// Capture the current stack trace and attempt to yield execution back to the scheduler.
-///
-/// Note that it is not possible to guarantee that execution immediately returns all the way to
-/// the scheduler, as the yielding future may be wrapped in another future that polls other futures
-/// (for instance a `select!` macro, or FuturesOrdered/FuturesUnordered collection). Also, it is
-/// possible for an intermediate future to poll() the YieldToScheduler instance again before it is
-/// woken.  However, we do guarantee not to wake the future until execution has returned to the
-/// scheduler.
-pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+/// bz: when EXHAUSTIVE = true, called by YieldToScheduler::poll()
+fn poll_exhaustive(cx: &mut Context<'_>) -> Poll<()> {
+    let info = context::current_task(); // bz: current task info
+    if DEBUG_DETAIL {
+        info!(
+            // bz: debug
+            "working on task with node id {:?}, name {:?}, task id {:?}",
+            info.node(),
+            info.name(),
+            info.task_id,
+        );
+    }
+
+    let handle = runtime::Handle::current();
+    if handle.task.iter == 0 {
+        if DEBUG {
+            info!("ready for EXHAUSTIVE iter == 0 initial run.");
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    // bz: for computed schedules
+    let len_order = handle.task.size_of_order();
+    if len_order == 0 {
+        // bz: no pushed yield task yet, or all have been executed
+        if DEBUG_DETAIL {
+            info!("no tasks spawned yet");
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    if get_release() {
+        if DEBUG_DETAIL {
+            // bz: the following if else is for debugging
+            if len_order == 0 {
+                info!("already send all yield tasks to executor, waiting to run.");
+            } else {
+                info!("already waked all yield tasks.");
+            }
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    let mut last_captures = handle.task.last_captures.lock().unwrap();
+    let l_last_captures = last_captures.len();
+
+    if DEBUG {
+        info!(
+            "#order = {:?} #last_captures = {:?}",
+            len_order, l_last_captures
+        );
+    }
+
+    let order = handle.task.order.lock().unwrap();
+    let _task_id = &order[len_order - 1].task_id.clone();
+    drop(order); // bz: early drop the lock
+
+    if info.task_id == _task_id.clone() {
+        if l_last_captures == len_order {
+            if DEBUG_DETAIL {
+                info!("pushed the same task already, got polled again. skip.");
+            }
+        } else if l_last_captures == len_order - 1 {
+            // bz: we havent push this task to last_captures, push now
+            if DEBUG_DETAIL {
+                info!(
+                    // bz: debug
+                    "pushing task with node id {:?}, name {:?}, task id {:?}",
+                    info.node(),
+                    info.name(),
+                    info.task_id,
+                );
+            }
+            let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
+            last_captures.push(new_capture);
+
+            if DEBUG_DETAIL {
+                info!("#last_captures = {:?} (after push)", last_captures.len());
+            }
+        }
+    }
+    drop(last_captures);
+
+    if DEBUG_DETAIL {
+        info!("{}", "*****".repeat(15));
+    }
+
+    Poll::Pending
+}
+
+/// bz: when EXHAUSTIVE = false, called by YieldToScheduler::poll()
+fn poll_random(cx: &mut Context<'_>) -> Poll<()> {
+    let info = context::current_task(); // bz: current task info
+    if DEBUG_DETAIL {
+        info!(
+            // bz: debug
+            "working on task with node id {:?}, name {:?}, task id {:?}",
+            info.node(),
+            info.name(),
+            info.task_id,
+        );
+    }
+
+    let handle = runtime::Handle::current();
+    let len_order = handle.task.size_of_order();
+    if len_order == 0 {
+        // bz: no pushed yield task yet, or all have been executed
+        if DEBUG_DETAIL {
+            info!("no tasks spawned by the yield node yet");
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    // bz: return ready for non-yield node's tasks
+    let yield_node_id = handle.task.yield_node_id.load(Ordering::SeqCst);
+    if info.node() != NodeId(yield_node_id) {
+        if DEBUG {
+            info!("ready for tasks spawned by non-yield nodes");
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    if get_release() {
+        if DEBUG_DETAIL {
+            // bz: the following if else is for debugging
+            if len_order == 0 {
+                info!("already send all yield tasks to executor, waiting to run.");
+            } else {
+                info!("already waked all yield tasks.");
+            }
+            info!("{}", "*****".repeat(15));
+        }
+        return Poll::Ready(());
+    }
+
+    let mut last_captures = handle.task.last_captures.lock().unwrap();
+    let l_last_captures = last_captures.len();
+
+    if DEBUG {
+        info!(
+            "#order = {:?} #last_captures = {:?}",
+            len_order, l_last_captures
+        );
+    }
+
+    let order = handle.task.order.lock().unwrap();
+    let _task_id = &order[len_order - 1].task_id.clone();
+    drop(order); // bz: early drop the lock
+
+    if info.task_id == _task_id.clone() {
+        if l_last_captures == len_order {
+            if DEBUG_DETAIL {
+                info!("pushed the same task already, got polled again. skip.");
+            }
+        } else if l_last_captures == len_order - 1 {
+            // bz: we havent push this task to last_captures, push now
+            if DEBUG_DETAIL {
+                info!(
+                    // bz: debug
+                    "pushing task with node id {:?}, name {:?}, task id {:?}",
+                    info.node(),
+                    info.name(),
+                    info.task_id,
+                );
+            }
+            let new_capture = Arc::new((info, cx.waker().clone(), Backtrace::new()));
+            last_captures.push(new_capture);
+
+            if DEBUG_DETAIL {
+                info!("#last_captures = {:?} (after push)", last_captures.len());
+            }
+        }
+    }
+    drop(last_captures);
+
+    // bz: we initialize it with a random number
+    let mut threshold = THRESHOLD.load(Ordering::SeqCst);
+    if threshold == 0 {
+        threshold = initial_threshold();
+    }
+
+    // bz: check if its time to release yield tasks
+    let n = PASSED_INSTRUMENTED_YIELDS.load(Ordering::SeqCst);
+    if n >= threshold {
+        if DEBUG {
+            info!("Reached THRESHOLD = {:?}", threshold);
+            info!("RELEASE ready (due to reaching THRESHOLD).");
+            info!("{}", "*****".repeat(15));
+        }
+
+        set_release_to_true();
+        return Poll::Ready(());
+    }
+
+    if DEBUG_DETAIL {
+        info!("{}", "*****".repeat(15));
+    }
+
+    Poll::Pending
+}
+
+fn instrumented_yield_random() {
     if DEBUG {
         // bz: debug
         info!("{}", "-----".repeat(15));
-        // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
     }
 
     // bz: record the current task
@@ -440,29 +552,13 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     let handle = runtime::Handle::current();
     let len_order = handle.task.size_of_order();
     if len_order == 0 && !get_release() {
-        let yield_node_id = handle.task.yield_node_id.load(Ordering::SeqCst);
-        if yield_node_id == 0 {
-            // bz: the 1st time of yielding tasks, all test nodes should be created already
-            // we randomly pick a node to yield all its tasks
-            let rng = handle.rand;
-            let nodes = handle.task.nodes.lock().unwrap();
-            let node_idx = rng.with(|rng| rng.gen_range(2..nodes.keys().len() + 1)); // 0 is main, 1 is client
-            drop(nodes);
-
-            handle
-                .task
-                .yield_node_id
-                .store(node_idx.try_into().unwrap(), Ordering::SeqCst);
-
-            if DEBUG {
-                info!("PICK YIELD NodeId = {:?} to yield all its tasks.", node_idx);
-            }
-        }
+        handle.task.initial_yield_node_id();
     }
 
     let mut order = handle.task.order.lock().unwrap();
     let yield_node_id = handle.task.yield_node_id.load(Ordering::SeqCst);
     if info.node() == NodeId(yield_node_id) {
+        // bz: randomly pick yield_node_id
         order.push(info.clone());
     }
 
@@ -485,6 +581,67 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     }
 
     drop(order);
+}
+
+fn instrumented_yield_exhaustive() {
+    if DEBUG {
+        // bz: debug
+        info!("{}", "-----".repeat(15));
+    }
+
+    // bz: record the current task
+    let info = context::current_task(); // return type is TaskInfo
+
+    if DEBUG {
+        info!(
+            // bz: debug
+            "Yield current task with node id {:?}, name {:?}, task id {:?}",
+            info.node(),
+            info.name(),
+            info.task_id,
+        );
+    }
+
+    let handle = runtime::Handle::current();
+    let mut order = handle.task.order.lock().unwrap();
+    order.push(info.clone()); // bz: all tasks will be in order at the end
+
+    if DEBUG {
+        // bz: debug
+        info!("Current order is (after push): #order = {:?}", order.len());
+        for e in order.iter() {
+            info!(
+                " - node id {:?}, name {:?}, task id {:?}",
+                e.node(),
+                e.name(),
+                e.task_id
+            );
+        }
+        info!("{}", "-----".repeat(15)); // bz: debug
+    }
+
+    drop(order);
+}
+
+/// Capture the current stack trace and attempt to yield execution back to the scheduler.
+///
+/// Note that it is not possible to guarantee that execution immediately returns all the way to
+/// the scheduler, as the yielding future may be wrapped in another future that polls other futures
+/// (for instance a `select!` macro, or FuturesOrdered/FuturesUnordered collection). Also, it is
+/// possible for an intermediate future to poll() the YieldToScheduler instance again before it is
+/// woken.  However, we do guarantee not to wake the future until execution has returned to the
+/// scheduler.
+pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    // info!("instrumented_yield backtrace:\n{}\n", std::backtrace::Backtrace::force_capture());
+    let exhaustive = EXHAUSTIVE.load(Ordering::SeqCst);
+    match exhaustive {
+        true => {
+            instrumented_yield_exhaustive();
+        }
+        false => {
+            instrumented_yield_random();
+        }
+    }
 
     Box::pin(YieldToScheduler::default())
 }
@@ -494,7 +651,7 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
 // }
 
 impl Executor {
-    pub fn new(rand: GlobalRng) -> Self {
+    pub fn new(rand: GlobalRng, iter: usize) -> Self {
         let (sender, queue) = channel();
         let (yield_sender, yield_queue) = channel();
         Executor {
@@ -509,6 +666,7 @@ impl Executor {
                 yield_node_id: Arc::new(AtomicU64::new(0)),
                 yield_sender,
                 paused_node_id: Arc::new(Mutex::new(Vec::new())),
+                iter,
             },
             time: TimeRuntime::new(&rand),
             rand,
@@ -541,7 +699,9 @@ impl Executor {
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
                 let len_order = self.handle.size_of_order();
                 let release = get_release();
-                if len_order > 0 && !release {
+                let exhaustive = EXHAUSTIVE.load(Ordering::SeqCst);
+
+                if len_order > 0 && !release && ((exhaustive && self.handle.iter > 0 ) || (!exhaustive)){
                     // bz: we still have yield tasks, let them be ready
                     if DEBUG {
                         info!("RELEASE ready (due to poll ready in executor, but still has yield tasks).");
@@ -557,6 +717,12 @@ impl Executor {
 
                 // bz: resume the paused kill/delete node tasks
                 self.handle.resume_paused_node_id();
+
+                if exhaustive && self.handle.iter == 0 {
+                    // bz: copy order before it's gone
+                    copy_orders();
+                    return val;
+                }
 
                 return val;
             }
@@ -595,8 +761,14 @@ impl Executor {
         let release = get_release();
         let len_order = self.handle.size_of_order();
         if release && len_order > 0 {
-            return self.yield_queue.try_recv_yield(&self.rand);
+            let exhaustive = EXHAUSTIVE.load(Ordering::SeqCst);
+            if exhaustive {
+                return self.yield_queue.try_recv_schedule();
+            } else {
+                return self.yield_queue.try_recv_yield(&self.rand);
+            }
         } else {
+            // will always fall here if EXHAUSTIVE && handle.task.iter == 0
             return self.queue.try_recv_random(&self.rand);
         }
     }
@@ -743,7 +915,11 @@ pub(crate) struct TaskHandle {
 
     // bz: record paused node id
     paused_node_id: Arc<Mutex<Vec<Arc<NodeId>>>>,
+
+    // bz: which iteration it is from parse_test()
+    iter: usize,
 }
+
 assert_send_sync!(TaskHandle);
 
 struct Node {
@@ -754,6 +930,26 @@ struct Node {
 }
 
 impl TaskHandle {
+    /// bz: the 1st time of yielding tasks, all test nodes should be created already
+    /// we randomly pick a node to yield all its tasks
+    fn initial_yield_node_id(&self) {
+        let yield_node_id = self.yield_node_id.load(Ordering::SeqCst);
+        if yield_node_id == 0 {
+            let handle = runtime::Handle::current();
+            let rng = handle.rand;
+            let nodes = self.nodes.lock().unwrap();
+            let node_idx = rng.with(|rng| rng.gen_range(2..nodes.keys().len() + 1)); // 0 is main, 1 is client
+            drop(nodes);
+
+            self.yield_node_id
+                .store(node_idx.try_into().unwrap(), Ordering::SeqCst);
+
+            if DEBUG {
+                info!("PICK YIELD NodeId = {:?} to yield all its tasks.", node_idx);
+            }
+        }
+    }
+
     /// bz: get size of order
     pub fn size_of_order(&self) -> usize {
         let order = self.order.lock().unwrap();
@@ -1431,7 +1627,7 @@ mod tests {
     fn random_select_from_ready_tasks() {
         let mut seqs = HashSet::new();
         for seed in 0..10 {
-            let runtime = Runtime::with_seed_and_config(seed, crate::SimConfig::default());
+            let runtime = Runtime::with_seed_and_config(seed, crate::SimConfig::default(), 0);
             let seq = runtime.block_on(async {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let mut tasks = vec![];
@@ -1610,6 +1806,29 @@ struct Inner {
     queue: Mutex<Vec<(Runnable, Arc<TaskInfo>)>>,
 }
 
+// impl Inner {
+//     fn find_idx_for(&self, other: Arc<TaskInfo>) -> usize {
+//         let mut queue = self.queue.lock().unwrap();
+//         for (idx, e) in queue.iter().enumerate() {
+//             // bz: find which idx in queue is the last element in order
+//             let (_, info) = e;
+//             if other == info.clone() {
+//                 if DEBUG {
+//                     info!(
+//                         "find_idx_for: PICK YIELD TASK with idx = {:?}",
+//                         other.task_id
+//                     );
+//                     info!("{}", "~~~~~".repeat(15));
+//                 }
+
+//                 return idx;
+//             }
+//         }
+
+//         panic!("Inner: find_idx_for: cannot find the idx.")
+//     }
+// }
+
 impl Clone for Sender {
     fn clone(&self) -> Self {
         Self {
@@ -1704,7 +1923,6 @@ impl Receiver {
                 "try_recv_yield: the order should not be empty."
             );
 
-            let handle = runtime::Handle::current();
             let mut order = handle.task.order.lock().unwrap();
 
             // bz: we return yield tasks in reverse order firstly
@@ -1727,7 +1945,7 @@ impl Receiver {
                 }
             }
 
-            // bz: when we have multiple calls of instrumented_yield()
+            // bz: when we have multiple calls of instrumented_yield() in one task
             // randomly pick a yield task from order
             // TODO: better solution
             let idx = rng.with(|rng| rng.gen_range(0..order.len()));
@@ -1750,6 +1968,61 @@ impl Receiver {
             }
 
             panic!("panic in try_recv_yield: should not come to this point.");
+        } else if Arc::weak_count(&self.inner) == 0 {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    /// bz: return tasks according to CURRENT_ORDER
+    pub fn try_recv_schedule(&self) -> Result<Option<(Runnable, Arc<TaskInfo>)>, TryRecvError> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        if !queue.is_empty() {
+            let handle = runtime::Handle::current();
+            let len_order = handle.task.size_of_order();
+
+            if DEBUG {
+                info!("{}", "~~~~~".repeat(15));
+                info!(
+                    "try_recv_schedule: #queue = {:?} #order = {:?} #release = {:?}",
+                    queue.len(),
+                    len_order,
+                    RELEASE,
+                );
+            }
+
+            assert!(
+                len_order > 0,
+                "try_recv_schedule: the order should not be empty."
+            );
+
+            let order = handle.task.order.lock().unwrap();
+
+            // bz: we return yield tasks as CURRENT_SCHEDULE_IDX
+            let mut current = CURRENT_SCHEDULE_IDX.lock().unwrap();
+            let pick_idx = current.remove(0); // bz: will panic if no elememt
+            let tasks = TASKS.lock().unwrap();
+            let pick = &tasks[pick_idx];
+            for (idx, e) in queue.iter().enumerate() {
+                // bz: find which idx in queue is the last element in order
+                let (_, info) = e;
+                if pick.task_id == info.task_id {
+                    if DEBUG {
+                        info!(
+                            "try_recv_schedule: PICK YIELD TASK with idx = {:?}",
+                            pick.task_id
+                        );
+                        info!("{}", "~~~~~".repeat(15));
+                    }
+
+                    drop(order);
+                    drop(current);
+                    return Ok(Some(queue.swap_remove(idx)));
+                }
+            }
+
+            panic!("panic in try_recv_schedule: should not come to this point.");
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
         } else {

@@ -55,14 +55,17 @@ impl Runtime {
 
     /// Create a new runtime instance with a given seed and default config.
     pub fn with_seed(seed: u64) -> Self {
-        Self::with_seed_and_config(seed, SimConfig::default())
+        Self::with_seed_and_config(seed, SimConfig::default(), 0)
     }
 
     /// Create a new runtime instance with given seed and config.
-    pub fn with_seed_and_config(seed: u64, config: SimConfig) -> Self {
+    /// bz: also tell Executor which iteration it is, works when EXHAUSTIVE = true
+    /// for 1st iteration (i.e., iter == 0), we use the default random scheduler to record calls of instrumented_yield()
+    /// then for each iteration, we run a schedule from all the enumerated orders of calls
+    pub fn with_seed_and_config(seed: u64, config: SimConfig, iter: usize) -> Self {
         let mut rand = rand::GlobalRng::new_with_seed(seed);
         tokio::msim_adapter::util::reset_rng(rand.gen::<u64>());
-        let task = task::Executor::new(rand.clone());
+        let task = task::Executor::new(rand.clone(), iter);
         let handle = Handle {
             rand: rand.clone(),
             time: task.time_handle().clone(),
@@ -311,7 +314,7 @@ impl Handle {
         let len_order = self.task.size_of_order();
         if len_order > 0 {
             if crate::task::DEBUG {
-                tracing::info!("handle going to kill/delete this node with {:?}", id);
+                tracing::info!("handler going to kill/delete this node with {:?}", id);
             }
             self.pause(id);
             self.task.push_paused_node_id(id);

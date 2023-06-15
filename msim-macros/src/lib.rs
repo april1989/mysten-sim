@@ -233,7 +233,9 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
             } else {
                 ::std::time::SystemTime::now().duration_since(::std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs()
             };
-            let mut count: u64 = if let Ok(num_str) = std::env::var("MSIM_TEST_NUM") {
+
+            // bz: change type of count from u64 to usize: converting is so messy
+            let mut count: usize = if let Ok(num_str) = std::env::var("MSIM_TEST_NUM") {
                 num_str.parse().expect("MSIM_TEST_NUM should be an integer")
             } else {
                 1
@@ -245,6 +247,14 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
             if check {
                 count = count.max(2);
             }
+
+            // bz: EXHAUSTIVE = true: we execute all schedules
+            let exhaustive: bool = if let Ok(val) = std::env::var("MSIM_EXHAUSTIVE") {
+                msim::task::set_exhaustive_to_true();
+                val.parse().expect("MSIM_EXHAUSTIVE should be a bool")
+            } else {
+                false
+            };
 
             let watchdog_timeout = ::std::time::Duration::from_millis(
                 ::std::env::var("MSIM_WATCHDOG_TIMEOUT_MS")
@@ -259,14 +269,39 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
                 #crate_ident::rand::GlobalRng::new_with_seed(seed).gen::<u64>()
             }
 
+            // bz: permutate all possible schedules
+            fn permutations(v: &[usize]) -> Vec<Vec<usize>> {
+                if v.len() == 0 {
+                    vec![]
+                } else if v.len() == 1 {
+                    vec![v.to_vec()]
+                } else {
+                    permutations(&v[1..])
+                        .iter()
+                        .map(|p| {
+                            let mut perms = vec![];
+                            for i in 0..p.len() + 1 {
+                                let mut perm = p.clone();
+                                perm.insert(i, v[0]);
+                                perms.push(perm);
+                            }
+                            perms
+                        })
+                        .flatten()
+                        .collect()
+                }
+            }
+
+
             let mut rand_log = None;
             let mut return_value = None;
+
             for i in 0..count {
                 let mut inner_seed = seed;
-                println!("starting test iteration {} with seed {}", i, inner_seed);
+                info!("starting test iteration {} with seed {}", i, inner_seed);
 
                 let config = std::thread::spawn(move || {
-                    let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default());
+                    let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default(), i);
                     rt.block_on(async move {
                         // run config_expr inside runtime so it can access rng.
                         #config_expr
@@ -294,7 +329,7 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
                         let sim_config = sim_config.clone();
                         let rand_log0 = rand_log.take();
                         let res = std::thread::spawn(move || {
-                            let mut rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, sim_config);
+                            let mut rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, sim_config, i);
                             if check {
                                 rt.enable_determinism_check(rand_log0);
                             }
@@ -334,6 +369,105 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
                     seed = next_seed(seed);
                 }
             }
+
+            // bz: when exhaustive == true
+            if exhaustive {
+                // bz: EXHAUSTIVE = true && i == 0 -> random scheduler
+                // EXHAUSTIVE = true && i > 0 -> run all schedules
+                // EXHAUSTIVE = false -> random THRESHOLD/PASSED_INSTRUMENTED_YIELDS/yield_node_id
+                
+                // bz: prepare 
+                info!("permutating all possible schedules ...");
+                let len_tasks = msim::task::size_of_tasks();
+                let v: Vec<usize> = (0..len_tasks).collect();
+                let perms = permutations(&v);
+                count = perms.len() + 1;
+                info!("NOTE: start to run all possible schedules, # = {:?}", count - 1);
+                info!("{:?}", perms);
+
+                for i in 1..count {
+                    let mut inner_seed = seed;
+                    info!("starting test iteration {} with seed {}", i, inner_seed);
+
+                    // bz: get schedule for this iteration
+                    let perm = &perms[i-1];
+                    msim::task::reset_flags();
+                    msim::task::set_current_schedule(perm);
+
+                    // bz: original workflow    
+                    let config = std::thread::spawn(move || {
+                        let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default(), i);
+                        rt.block_on(async move {
+                            // run config_expr inside runtime so it can access rng.
+                            #config_expr
+                        })
+                    }).join().expect("config generation thread panicked!");
+    
+                    let test_config: #crate_ident::TestConfig = config.into();
+                    if check {
+                        assert_eq!(
+                            test_config.configs.len(), 1,
+                            "can't check determinism with repeated test"
+                        );
+                    }
+    
+                    for (repeat, sim_config) in test_config.configs.iter() {
+                        assert_ne!(*repeat, 0);
+                        if check {
+                            assert_eq!(
+                                *repeat, 1,
+                                "can't check determinism with repeated test"
+                            );
+                        }
+    
+                        for _j in 0..*repeat {
+                            let sim_config = sim_config.clone();
+                            let rand_log0 = rand_log.take();
+                            let res = std::thread::spawn(move || {
+                                let mut rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, sim_config, i);
+                                if check {
+                                    rt.enable_determinism_check(rand_log0);
+                                }
+                                if let Some(limit) = time_limit_s {
+                                    rt.set_time_limit(::std::time::Duration::from_secs_f64(limit));
+                                }
+                                let rt = std::sync::Arc::new(std::sync::RwLock::new(Some(rt)));
+                                let (stop_tx, stop_rx) = ::tokio::sync::oneshot::channel();
+                                let watchdog = #crate_ident::runtime::start_watchdog(
+                                    rt.clone(), inner_seed, watchdog_timeout, stop_rx
+                                );
+    
+                                let rt_read = rt.read().unwrap();
+                                let ret = rt_read.as_ref().unwrap().block_on(async #body);
+                                let _ = stop_tx.send(());
+                                watchdog.join().unwrap();
+                                std::mem::drop(rt_read);
+    
+                                let log = rt.write().unwrap().take().unwrap().take_rand_log();
+                                (ret, log)
+                            }).join();
+                            match res {
+                                Ok((ret, log)) => {
+                                    return_value = Some(ret);
+                                    rand_log = log;
+                                }
+                                Err(e) => {
+                                    println!("note: run with `MSIM_TEST_SEED={}` environment variable to reproduce this error", inner_seed);
+                                    ::std::panic::resume_unwind(e);
+                                }
+                            }
+                            inner_seed += 1;
+                        }
+                    }
+    
+                    if !check {
+                        seed = next_seed(seed);
+                    }
+                }
+
+            }
+
+
             return_value.unwrap()
         }
     })
