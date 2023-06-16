@@ -183,3 +183,10 @@ MSIM_EXHAUSTIVE=true RUSTFLAGS="--cfg msim" cargo test
 
 1. caller/location of where `instrumented_yield()` is called: 
 
+
+
+### statically detected races in Sui
+
+1. guarded by `RwLockWriteGuard`
+2. 10 points of race pairs, force the order of a pair of instrumented_yield()
+3. `MSIM_TEST_SCHEDULE=1-2 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim cargo simtest test_create_advance_epoch_tx_race`
