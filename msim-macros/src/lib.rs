@@ -159,7 +159,207 @@ pub fn sim_test(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
     let args = syn::parse_macro_input!(args as syn::AttributeArgs);
 
-    parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    // parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    parse_test_schedule(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+}
+
+fn parse_test_schedule(
+    mut input: syn::ItemFn,
+    args: syn::AttributeArgs,
+) -> Result<TokenStream, syn::Error> {
+    if input.sig.asyncness.take().is_none() {
+        let msg = "the `async` keyword is missing from the function declaration";
+        return Err(syn::Error::new_spanned(input.sig.fn_token, msg));
+    }
+
+    let test_config = build_test_config(args)?;
+
+    let body = &input.block;
+
+    let (last_stmt_start_span, last_stmt_end_span) = {
+        let mut last_stmt = input
+            .block
+            .stmts
+            .last()
+            .map(ToTokens::into_token_stream)
+            .unwrap_or_default()
+            .into_iter();
+        // `Span` on stable Rust has a limitation that only points to the first
+        // token, not the whole tokens. We can work around this limitation by
+        // using the first/last span of the tokens like
+        // `syn::Error::new_spanned` does.
+        let start = last_stmt.next().map_or_else(Span::call_site, |t| t.span());
+        let end = last_stmt.last().map_or(start, |t| t.span());
+        (start, end)
+    };
+    let crate_name = test_config.crate_name.as_deref().unwrap_or("msim");
+    let crate_ident = Ident::new(crate_name, last_stmt_start_span);
+
+    let body: Box<syn::Block> = if test_config.run_in_client_node {
+        syn::parse2(quote_spanned! {last_stmt_start_span=>
+            {
+                use std::str::FromStr;
+                let ip = std::net::IpAddr::from_str("1.1.1.1").unwrap();
+                let handle = #crate_ident::runtime::Handle::current();
+                let builder = handle.create_node();
+                let node = builder
+                    .ip(ip)
+                    .name("client")
+                    .init(|| async {
+                        #crate_ident::tracing::info!("client restarted");
+                    })
+                    .build();
+
+                let res = node.spawn(async move #body).await
+                    .expect("join error in test runner");
+
+                handle.delete_node(node.id());
+
+                res
+            }
+        })
+        .expect("Parsing failure")
+    } else {
+        body.clone()
+    };
+
+    let config_expr = test_config.network_config_expr.unwrap_or_else(|| {
+        syn::parse2(quote! { #crate_ident::SimConfig::default() }).expect("parse error")
+    });
+
+    let check_determinism = test_config.check_determinism;
+
+    let brace_token = input.block.brace_token;
+    input.block = syn::parse2(quote_spanned! {last_stmt_end_span=>
+        {
+            let mut seed: u64 = if let Ok(seed_str) = ::std::env::var("MSIM_TEST_SEED") {
+                seed_str.parse().expect("MSIM_TEST_SEED should be an integer")
+            } else {
+                ::std::time::SystemTime::now().duration_since(::std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs()
+            };
+            let mut count: u64 = if let Ok(num_str) = std::env::var("MSIM_TEST_NUM") {
+                num_str.parse().expect("MSIM_TEST_NUM should be an integer")
+            } else {
+                1
+            };
+            let time_limit_s = std::env::var("MSIM_TEST_TIME_LIMIT").ok().map(|num_str| {
+                num_str.parse::<f64>().expect("MSIM_TEST_TIME_LIMIT should be an number")
+            });
+            let check = ::std::env::var("MSIM_TEST_CHECK_DETERMINISM").is_ok() || #check_determinism;
+            if check {
+                count = count.max(2);
+            }
+
+            let watchdog_timeout = ::std::time::Duration::from_millis(
+                ::std::env::var("MSIM_WATCHDOG_TIMEOUT_MS")
+                .ok()
+                .map(|num_str| {
+                    num_str.parse::<u64>().expect("MSIM_WATCHDOG_TIMEOUT_MS should be a number")
+                }).unwrap_or(5000)
+            );
+
+            let test_schedule_str = std::env::var("MSIM_TEST_SCHEDULE").unwrap_or_else(|_| String::new());
+            let test_schedules: Vec<&str> = test_schedule_str.split(',').collect();
+
+            fn next_seed(seed: u64) -> u64 {
+                use #crate_ident::rand::Rng;
+                #crate_ident::rand::GlobalRng::new_with_seed(seed).gen::<u64>()
+            }
+
+            let mut rand_log = None;
+            let mut return_value = None;
+            for (j, s) in test_schedules.iter().enumerate() {
+                let test_schedule: Vec<&str> = s.split('-').collect();
+                let test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
+                #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
+
+            for i in 0..count {
+                let mut inner_seed = seed;
+                #crate_ident::tracing::info!("starting test iteration {:?} with seed {}", i, inner_seed);
+                #crate_ident::task::set_input_schedule(test_schedule_x.clone());
+
+                let config = std::thread::spawn(move || {
+                    let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default());
+                    rt.block_on(async move {
+                        // run config_expr inside runtime so it can access rng.
+                        #config_expr
+                    })
+                }).join().expect("config generation thread panicked!");
+
+                let test_config: #crate_ident::TestConfig = config.into();
+                if check {
+                    assert_eq!(
+                        test_config.configs.len(), 1,
+                        "can't check determinism with repeated test"
+                    );
+                }
+
+                for (repeat, sim_config) in test_config.configs.iter() {
+                    assert_ne!(*repeat, 0);
+                    if check {
+                        assert_eq!(
+                            *repeat, 1,
+                            "can't check determinism with repeated test"
+                        );
+                    }
+
+                    for _j in 0..*repeat {
+                        let sim_config = sim_config.clone();
+                        let rand_log0 = rand_log.take();
+                        let res = std::thread::spawn(move || {
+                            let mut rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, sim_config);
+                            if check {
+                                rt.enable_determinism_check(rand_log0);
+                            }
+                            if let Some(limit) = time_limit_s {
+                                rt.set_time_limit(::std::time::Duration::from_secs_f64(limit));
+                            }
+                            let rt = std::sync::Arc::new(std::sync::RwLock::new(Some(rt)));
+                            let (stop_tx, stop_rx) = ::tokio::sync::oneshot::channel();
+                            let watchdog = #crate_ident::runtime::start_watchdog(
+                                rt.clone(), inner_seed, watchdog_timeout, stop_rx
+                            );
+
+                            let rt_read = rt.read().unwrap();
+                            let ret = rt_read.as_ref().unwrap().block_on(async #body);
+                            let _ = stop_tx.send(());
+                            watchdog.join().unwrap();
+                            std::mem::drop(rt_read);
+
+                            let log = rt.write().unwrap().take().unwrap().take_rand_log();
+                            (ret, log)
+                        }).join();
+                        match res {
+                            Ok((ret, log)) => {
+                                return_value = Some(ret);
+                                rand_log = log;
+                            }
+                            Err(e) => {
+                                println!("note: run with `MSIM_TEST_SEED={}` environment variable to reproduce this error", inner_seed);
+                                ::std::panic::resume_unwind(e);
+                            }
+                        }
+                        inner_seed += 1;
+                    }
+                }
+
+                if !check {
+                    seed = next_seed(seed);
+                }
+            }
+            }
+            return_value.unwrap()
+        }
+    })
+    .expect("Parsing failure");
+    input.block.brace_token = brace_token;
+
+    let result = quote! {
+        #[::core::prelude::v1::test]
+        #input
+    };
+
+    Ok(result.into())
 }
 
 fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenStream, syn::Error> {

@@ -185,37 +185,106 @@ impl TaskInfo {
     }
 }
 
-// Instrumentation to capture the stack trace of points of interest in the code.
-// Code can call `instrumented_yield` to allow the scheduler to see the stack trace
-// of the task that just yielded.
-thread_local! {
-    static LAST_CAPTURE: Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>> = Mutex::new(None);
-    static INPUT_SCHEDULE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    static YIELD_TASKS: Mutex<HashMap<usize,Waker>> = Mutex::new(HashMap::new());
-    static YIELD_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    static READY_TO_RELEASE: Mutex<bool> = Mutex::new(false);
+impl PartialEq for TaskInfo {
+    fn eq(&self, other: &TaskInfo) -> bool {
+        self.task_id == other.task_id
+    }
+}
+impl Eq for TaskInfo {}
+
+
+#[derive(Default)]
+struct YieldToScheduler(Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>);
+
+impl Future for YieldToScheduler {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        info!(
+            "polling backtrace: {}",
+            std::backtrace::Backtrace::force_capture()
+        ); // bz: debug
+
+        // capture the current stack trace
+        LAST_CAPTURE.with(|last_capture| {
+            let mut last_capture = last_capture.lock().unwrap();
+            match (&self.0, last_capture.as_ref()) {
+                (Some(this), Some(last)) => {
+                    assert!(Arc::ptr_eq(this, last));
+                    // we were polled again before control reached the scheduler
+                    warn!("YieldToScheduler polled before being woken");
+                    Poll::Pending
+                }
+                (Some(_), None) => {
+                    // the scheduler cleared the capture, so we are ready to resume.
+                    info!("poll ready");
+                    Poll::Ready(())
+                }
+                (None, Some(_)) => {
+                    // If this happens and can't be avoided, we could keep a Vec instead of Option
+                    // in LAST_CAPTURE, although the scheduler will have no ability to change the
+                    // ordering of such events.
+                    panic!(
+                        "instrumented_yield() called twice before control returned to scheduler"
+                    );
+                }
+                (None, None) => {
+                    trace!("capturing stack trace and yielding");
+                    let task = context::current_task();
+                    let new_capture = Arc::new((task, cx.waker().clone(), Backtrace::new()));
+                    *last_capture = Some(new_capture.clone());
+                    self.0 = Some(new_capture);
+                    Poll::Pending
+                }
+            }
+        })
+    }
 }
 
-/// bz: flags
-pub const DEBUG: bool = true; // bz: DEBUG = true: print out necessary debug info
-const DEBUG_DETAIL: bool = false; // DEBUG_DETAIL = true: print out all debug info, this can be super long
-static RELEASE: AtomicBool = AtomicBool::new(false); // bz: flag of whether it is the time to release yield tasks
+/// Capture the current stack trace and attempt to yield execution back to the scheduler.
+///
+/// Note that it is not possible to guarantee that execution immediately returns all the way to
+/// the scheduler, as the yielding future may be wrapped in another future that polls other futures
+/// (for instance a `select!` macro, or FuturesOrdered/FuturesUnordered collection). Also, it is
+/// possible for an intermediate future to poll() the YieldToScheduler instance again before it is
+/// woken.  However, we do guarantee not to wake the future until execution has returned to the
+/// scheduler.
+pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    info!("calling instrumented_yield"); // bz: debug
+                                         // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
 
-/// bz: set RELEASE to true
-pub fn set_release_to_true() {
-    RELEASE.store(true, Ordering::SeqCst);
-}
-
-/// bz: get the RELEASE flag
-pub fn get_release() -> bool {
-    let release = RELEASE.load(Ordering::SeqCst);
-    release
+    Box::pin(YieldToScheduler::default())
 }
 
 fn take_last_capture() -> Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>> {
     LAST_CAPTURE.with(|last_capture| last_capture.lock().unwrap().take())
 }
 
+// Instrumentation to capture the stack trace of points of interest in the code.
+// Code can call `instrumented_yield` to allow the scheduler to see the stack trace
+// of the task that just yielded.
+thread_local! {
+    static LAST_CAPTURE: Mutex<Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>> = Mutex::new(None); // bz: not used
+    static YIELD_TASKS: Mutex<HashMap<usize, Waker>> = Mutex::new(HashMap::new()); // bz: id -> waker
+    static YIELD_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: if from instrumented_yield(id)
+    static READY_TO_RELEASE: Mutex<bool> = Mutex::new(false); // bz: flag of whether it is the time to release yield tasks
+
+    static YIELD_TASKINFOS: Mutex<Vec<Arc<TaskInfo>>> = Mutex::new(Vec::new()); // bz: the order of yield tasks
+}
+
+static INPUT_SCHEDULE: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: from MSIM_TEST_SCHEDULE
+
+/// bz: flags
+pub const DEBUG: bool = true; // bz: DEBUG = true: print out necessary debug info
+const DEBUG_DETAIL: bool = false; // bz: DEBUG_DETAIL = true: print out all debug info, this can be super long
+
+/// bz: size of YIELD_TASKS
+pub fn size_of_yield_tasks() -> usize {
+    return YIELD_TASKS.with(|yield_tasks| {
+        let yield_tasks = yield_tasks.lock().unwrap();
+        yield_tasks.len()
+    });
+}
 
 #[derive(Default)]
 struct SkipScheduler(Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>);
@@ -235,18 +304,12 @@ impl Future for YieldToSchedulerX {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // warn!(
-        //     "jeff:YieldToSchedulerX id: {:?} input_schedule: {:?} backtrace:\n {}",
-        //     self.0,
-        //     INPUT_SCHEDULE,
-        //     std::backtrace::Backtrace::force_capture()
-        // );
-        info!("{}", "*****".repeat(15));
+        info!("{}", "*****".repeat(16));
         let info = context::current_task(); // bz: current task info
         if DEBUG {
             info!(
                 // bz: debug
-                "jeff:YieldToSchedulerX id: {:?}, node id {:?}, name {:?}, task id {:?}",
+                "YieldToSchedulerX id: {:?}, node id {:?}, name {:?}, task id {:?}",
                 self.0,
                 info.node(),
                 info.name(),
@@ -258,43 +321,47 @@ impl Future for YieldToSchedulerX {
         READY_TO_RELEASE.with(|ready_to_release| {
             let ready_to_release = ready_to_release.lock().unwrap();
             if *ready_to_release {
-                INPUT_SCHEDULE.with(|input_schedule| {
-                    let mut input_schedule = input_schedule.lock().unwrap();
-                    if input_schedule.len() == 0 {
-                        release = true;
-                    } else if input_schedule[0] == self.0 {
-                        input_schedule.remove(0);
-                        release = true;
-                        if input_schedule.len() > 0 {
-                            YIELD_TASKS.with(|yield_tasks| {
-                                let first_id = input_schedule[0];
-                                let mut yield_tasks = yield_tasks.lock().unwrap();
-                                if let Some(waker) = yield_tasks.get(&first_id) {
-                                    waker.wake_by_ref();
-                                    yield_tasks.remove(&first_id);
-                                }
-                            });
-                        }
-                    } else {
+                let mut input_schedule = INPUT_SCHEDULE.lock().unwrap();
+                if input_schedule.len() == 0 {
+                    release = true;
+                } else if input_schedule[0] == self.0 {
+                    input_schedule.remove(0);
+                    release = true;
+                    if input_schedule.len() > 0 {
+                        YIELD_TASKS.with(|yield_tasks| {
+                            let first_id = input_schedule[0];
+                            let mut yield_tasks = yield_tasks.lock().unwrap();
+                            if let Some(waker) = yield_tasks.get(&first_id) {
+                                waker.wake_by_ref();
+                                yield_tasks.remove(&first_id);
+                            }
+                        });
                     }
-                });
+                } else {
+                }
+                drop(input_schedule);
             }
         });
 
         if release {
-            info!("jeff:YieldToSchedulerX ready");
-            info!("{}", "*****".repeat(15));
+            if DEBUG {
+                info!("YieldToSchedulerX ready");
+                info!("{}", "*****".repeat(16));
+            }
 
             Poll::Ready(())
         } else {
-            info!("jeff:YieldToSchedulerX pending");
-            info!("{}", "*****".repeat(15));
+            if DEBUG {
+                info!("YieldToSchedulerX pending");
+                info!("{}", "*****".repeat(16));
+            }
 
             // capture the current stack trace
             YIELD_TASKS.with(|yield_tasks| {
                 let mut yield_tasks = yield_tasks.lock().unwrap();
                 yield_tasks.insert(self.0, cx.waker().clone());
             });
+
             Poll::Pending
         }
     }
@@ -303,77 +370,126 @@ impl Future for YieldToSchedulerX {
 /// Capture the current stack trace and attempt to yield execution back to the scheduler.
 /// with an id
 pub fn instrumented_yield_id(id: usize) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    let info = context::current_task(); // return type is TaskInfo
-    if info.inner.node.0 != 2 {
-        //TODO: do nothing
+    let info = context::current_task();
+    let input_schedule = INPUT_SCHEDULE.lock().unwrap();
+    let in_input_schedule = input_schedule.contains(&id);
+
+    if info.inner.node.0 != 2 || !in_input_schedule {
+        // do nothing
+        if DEBUG_DETAIL {
+            info!("{}", "-----".repeat(16));
+            info!(
+                "skip: instrumented_yield_id id {:?} node id {:?}, name {:?}, task id {:?}. ",
+                id,
+                info.node(),
+                info.name(),
+                info.task_id,
+            );
+            info!("{}", "-----".repeat(16));
+        }
+
         return Box::pin(SkipScheduler::default());
     }
-    // warn!(
-    //     "jeff:instrumented_yield_id {} node_id: {:?} backtrace:\n{}",
-    //     id,
-    //     info.inner.node,
-    //     std::backtrace::Backtrace::force_capture()
-    // );
-    info!("{}", "-----".repeat(15));
-    info!(
-        "jeff:instrumented_yield_id id {:?} node id {:?}, name {:?}, task id {:?}",
-        id,
-        info.node(),
-        info.name(),
-        info.task_id,
-    );
+
+    if DEBUG {
+        info!("{}", "-----".repeat(16));
+        info!(
+            "yield: instrumented_yield_id id {:?} node id {:?}, name {:?}, task id {:?}",
+            id,
+            info.node(),
+            info.name(),
+            info.task_id,
+        );
+    }
 
     YIELD_IDS.with(|yield_ids| {
         let mut yield_ids = yield_ids.lock().unwrap();
         yield_ids.push(id);
-        warn!("jeff:instrumented_yield_id yield_ids: {:?}", yield_ids);
+        if DEBUG {
+            warn!(
+                "instrumented_yield_id yield_ids: {:?} (after push)",
+                yield_ids
+            );
+        }
 
-        INPUT_SCHEDULE.with(|input_schedule| {
-            let input_schedule = input_schedule.lock().unwrap();
+        if DEBUG {
             info!(
-                "input_schedule.len: {}, yield_ids.len: {}",
+                "#input_schedule: {}, #yield_ids: {}",
                 input_schedule.len(),
                 yield_ids.len()
             );
-            if input_schedule.len() > 0 && input_schedule.len() == yield_ids.len() {
-                READY_TO_RELEASE.with(|ready_to_release| {
-                    let mut ready_to_release = ready_to_release.lock().unwrap();
-                    warn!("jeff:instrumented_yield_id set ready_to_release to true");
-                    *ready_to_release = true;
+        }
+        if input_schedule.len() > 0 && input_schedule.len() == yield_ids.len() {
+            READY_TO_RELEASE.with(|ready_to_release| {
+                let mut ready_to_release = ready_to_release.lock().unwrap();
+                if DEBUG {
+                    warn!("instrumented_yield_id set READY_TO_RELEASE to true");
+                }
+                *ready_to_release = true;
 
-                    YIELD_TASKS.with(|yield_tasks| {
-                        let first_id = input_schedule[0];
-                        let mut yield_tasks = yield_tasks.lock().unwrap();
-                        if let Some(waker) = yield_tasks.get(&first_id) {
-                            waker.wake_by_ref();
-                            yield_tasks.remove(&first_id);
-                        }
-                    });
+                YIELD_TASKS.with(|yield_tasks| {
+                    let first_id = input_schedule[0];
+                    let mut yield_tasks = yield_tasks.lock().unwrap();
+                    if let Some(waker) = yield_tasks.get(&first_id) {
+                        waker.wake_by_ref();
+                        yield_tasks.remove(&first_id);
+                    }
                 });
-            }
-        });
+            });
+        }
+        drop(input_schedule);
     });
-    info!("{}", "-----".repeat(15));
+
+    YIELD_TASKINFOS.with(|yield_infos| {
+        let mut yield_infos = yield_infos.lock().unwrap();
+        yield_infos.push(info.clone());
+
+        if DEBUG {
+            // bz: debug
+            info!(
+                "Current YIELD_TASKINFOS is (after push): # = {:?}",
+                yield_infos.len()
+            );
+            for e in yield_infos.iter() {
+                info!(
+                    " - node id {:?}, name {:?}, task id {:?}",
+                    e.node(),
+                    e.name(),
+                    e.task_id
+                );
+            }
+        }
+    });
+
+    info!("{}", "-----".repeat(16));
 
     Box::pin(YieldToSchedulerX(id))
 }
 
+/// bz: set INPUT_SCHEDULE for this iteration
+pub fn set_input_schedule(test_schedule_x: Vec<usize>) {
+    let mut input_schedule = INPUT_SCHEDULE.lock().unwrap();
+    *input_schedule = test_schedule_x.clone();
+}
+
 impl Executor {
     pub fn new(rand: GlobalRng) -> Self {
-        let test_schedule_str =
-            std::env::var("MSIM_TEST_SCHEDULE").unwrap_or_else(|_| String::new());
-        let test_schedule: Vec<&str> = test_schedule_str.split('-').collect();
-        let test_schedule_x: Vec<usize> = test_schedule
-            .iter()
-            .map(|s| s.parse::<usize>().unwrap())
-            .collect();
+        // let test_schedule_str =
+        //     std::env::var("MSIM_TEST_SCHEDULE").unwrap_or_else(|_| String::new());
+        // let test_schedule: Vec<&str> = test_schedule_str.split('-').collect();
+        // let test_schedule_x: Vec<usize> = test_schedule
+        //     .iter()
+        //     .map(|s| s.parse::<usize>().unwrap())
+        //     .collect();
 
-        INPUT_SCHEDULE.with(|input_schedule| {
-            let mut input_schedule = input_schedule.lock().unwrap();
-            *input_schedule = test_schedule_x.clone();
-        });
+        // INPUT_SCHEDULE.with(|input_schedule| {
+        //     let mut input_schedule = input_schedule.lock().unwrap();
+        //     *input_schedule = test_schedule_x.clone();
+        // });
 
-        info!("Test Schedule: {:?}", test_schedule_x);
+        // if DEBUG {
+        //     info!("Test Schedule: {:?}", test_schedule_x);
+        // }
 
         let (sender, queue) = channel();
         Executor {
@@ -383,8 +499,7 @@ impl Executor {
                 sender,
                 next_node_id: Arc::new(AtomicU64::new(1)),
                 next_task_id: Arc::new(AtomicU64::new(1)),
-                order: Arc::new(Mutex::new(Vec::new())),
-                last_captures: Arc::new(Mutex::new(Vec::new())),
+                paused_node_id: Arc::new(Mutex::new(Vec::new())),
             },
             time: TimeRuntime::new(&rand),
             rand,
@@ -414,6 +529,12 @@ impl Executor {
         loop {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
+                if DEBUG {
+                    info!("executor: done");
+                }
+                // bz: resume the paused kill/delete node tasks
+                self.handle.resume_paused_node_id();
+
                 return val;
             }
 
@@ -463,8 +584,8 @@ impl Executor {
             }
         }));
 
-        // while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
-        while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
+        while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
+            // while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
             // normal execution
             if *info.killed.borrow() {
                 // killed task: must enter the task before dropping it, so that
@@ -481,13 +602,22 @@ impl Executor {
 
             // run task
             if DEBUG && info.name() != "main" {
-                info!(
-                    // bz: debug
-                    "-> executor running task with node id {:?}, name {:?}, task id {:?}",
-                    info.node(),
-                    info.name(),
-                    info.task_id,
-                );
+                YIELD_TASKINFOS.with(|yield_taskinfos|{
+                    let mut yield_taskinfos = yield_taskinfos.lock().unwrap();
+                if yield_taskinfos.contains(&info) {
+                    info!(
+                        // bz: debug
+                        "-> executor running task with node id {:?}, name {:?}, task id {:?}",
+                        info.node(),
+                        info.name(),
+                        info.task_id,
+                    );
+
+                    if let Some(index) = yield_taskinfos.iter().position(|value| *value == info) {
+                        yield_taskinfos.swap_remove(index);
+                    }
+                }
+                });
             }
 
             let node_id = info.node();
@@ -511,31 +641,6 @@ impl Executor {
             //     //     _captured_stack
             //     // ); // bz: debug
             // }
-
-            let mut last_captures = self.handle.last_captures.lock().unwrap();
-            if get_release() && last_captures.len() > 0 {
-                // bz:  wake up the yield tasks
-                if DEBUG {
-                    info!("{}", ".....".repeat(15));
-                    info!("Wake all yield tasks and clear last_captures.");
-                }
-
-                for capture in last_captures.iter() {
-                    let (_task, waker, _captured_stack) = (*capture).deref();
-                    waker.wake_by_ref();
-
-                    if DEBUG {
-                        info!(" - waking task id {:?}", _task.task_id);
-                    }
-                }
-
-                if DEBUG {
-                    info!("{}", ".....".repeat(15));
-                }
-
-                last_captures.clear();
-            }
-            drop(last_captures);
 
             if let Err(err) = result {
                 if let Some(panic_info) = err.downcast_ref::<PanicWrapper>() {
@@ -588,9 +693,8 @@ pub(crate) struct TaskHandle {
     next_node_id: Arc<AtomicU64>,
     next_task_id: Arc<AtomicU64>,
 
-    // bz: record the order of yield tasks
-    order: Arc<Mutex<Vec<Arc<TaskInfo>>>>,
-    last_captures: Arc<Mutex<Vec<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>>>,
+    // bz: record paused node id
+    paused_node_id: Arc<Mutex<Vec<Arc<NodeId>>>>,
 }
 assert_send_sync!(TaskHandle);
 
@@ -602,6 +706,29 @@ struct Node {
 }
 
 impl TaskHandle {
+    /// bz: push paused node id to paused_node_id
+    pub fn push_paused_node_id(&self, id: NodeId) {
+        let mut paused_node_id = self.paused_node_id.lock().unwrap();
+        paused_node_id.push(id.into());
+    }
+
+    /// bz: resume the paused node id from paused_node_id
+    pub fn resume_paused_node_id(&self) {
+        let paused_node_id = self.paused_node_id.lock().unwrap();
+        if paused_node_id.len() == 0 {
+            return;
+        }
+        if DEBUG {
+            info!("resume paused kill/delete node tasks:")
+        }
+        for id in paused_node_id.iter() {
+            if DEBUG {
+                info!(" - resume {:?}", id);
+            }
+            crate::runtime::Handle::current().resume(**id);
+        }
+    }
+
     /// Kill all tasks of the node.
     pub fn kill(&self, id: NodeId) {
         TimeHandle::current().disable_node_and_cancel_timers(id);
@@ -658,7 +785,7 @@ impl TaskHandle {
         let name = name.unwrap_or_else(|| format!("node-{}", id.0));
         let task_id = TaskId(self.next_task_id.fetch_add(1, Ordering::SeqCst));
 
-        if DEBUG {
+        if DEBUG_DETAIL {
             info!(
                 // bz: debug
                 "creating node id = {:?} name = {:?} task id = {:?}",
@@ -739,7 +866,7 @@ impl TaskNodeHandle {
             self.info.inner.name.clone(),
         ));
 
-        if DEBUG {
+        if DEBUG_DETAIL {
             info!(
                 // bz: debug
                 "creating task: node id = {:?} name = {:?} task id = {:?} (increment task id)",
@@ -762,6 +889,7 @@ impl TaskNodeHandle {
         let sender = self.sender.clone();
         let info = self.info.clone();
         let mut killed_rx = info.killed.subscribe();
+        let _info = self.info.clone();
 
         let future = async move {
             pin_mut!(future);
@@ -775,7 +903,7 @@ impl TaskNodeHandle {
                             // killed. (Otherwise the task will not be dropped until its next
                             // scheduled wakeup, which may be never if it is listening for network
                             // messages).
-                            panic!("killed task must not run!");
+                            panic!("killed task must not run! node id {:?}, name {:?}, task id {:?}", _info.inner.node, _info.inner.name, _info.task_id);
                         }
                     }
 
@@ -796,7 +924,7 @@ impl TaskNodeHandle {
                 // );
                 match &new_info {
                     Some(_info) => {
-                        if DEBUG && _info.inner.name != "main" {
+                        if DEBUG_DETAIL && _info.inner.name != "main" {
                             // bz: debug
                             info!(
                                 "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
@@ -806,7 +934,7 @@ impl TaskNodeHandle {
                         let _ = sender.send((runnable, _info.clone()));
                     }
                     None => {
-                        if DEBUG && info.inner.name != "main" {
+                        if DEBUG_DETAIL && info.inner.name != "main" {
                             // bz: debug
                             info!(
                                 "-> send in TaskNodeHandle: node id {:?}, name {:?}, task id {:?}",
@@ -1399,129 +1527,6 @@ impl Receiver {
         let mut queue = self.inner.queue.lock().unwrap();
         if !queue.is_empty() {
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            Ok(queue.swap_remove(idx))
-        } else if Arc::weak_count(&self.inner) == 0 {
-            Err(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
-        }
-    }
-
-    /// bz: a simplest try: we send the tasks back in a reverse order of Executor.handle.order
-    pub fn try_simple_schedule(
-        &self,
-        rng: &GlobalRng,
-    ) -> Result<(Runnable, Arc<TaskInfo>), TryRecvError> {
-        let mut queue = self.inner.queue.lock().unwrap();
-        if !queue.is_empty() {
-            let handle = runtime::Handle::current();
-            let mut order = handle.task.order.lock().unwrap();
-            if order.len() > 0 {
-                let release = get_release();
-
-                if DEBUG {
-                    info!("{}", "~~~~~".repeat(15));
-                    info!(
-                        "try_simple_schedule: #queue = {:?} #order = {:?} #release = {:?}",
-                        queue.len(),
-                        order.len(),
-                        release,
-                    );
-                }
-
-                if release {
-                    // bz: we return yield tasks in reverse order firstly
-                    if let Some(last) = order.pop() {
-                        for (idx, e) in queue.iter().enumerate() {
-                            // bz: find which idx in queue is the last element in order
-                            let (_, info) = e;
-                            if last.task_id == info.task_id {
-                                if DEBUG {
-                                    info!(
-                                        "try_simple_schedule: PICK YIELD TASK with idx = {:?}",
-                                        last.task_id
-                                    );
-                                    info!("{}", "~~~~~".repeat(15));
-                                }
-
-                                drop(order);
-                                return Ok(queue.swap_remove(idx));
-                            }
-                        }
-                    }
-
-                    assert!(
-                        true,
-                        "panic in try_simple_schedule: should not come to this point."
-                    )
-                }
-
-                // bz: random choose one task, but make sure do not release yield tasks
-                for (idx, y) in queue.iter().enumerate() {
-                    let mut found_idx = true;
-                    for x in order.iter() {
-                        match x.task_id == y.1.task_id {
-                            true => {
-                                if DEBUG {
-                                    println!("order={}, queue={}", x.task_id, y.1.task_id);
-                                }
-                                found_idx = false;
-                                break;
-                            }
-                            false => {
-                                if DEBUG {
-                                    println!("queue={}, no matching in order", y.1.task_id);
-                                }
-                            }
-                        }
-                    }
-                    if found_idx {
-                        // bz: tmp return this TODO: random this selection
-                        if DEBUG {
-                            info!(
-                                "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
-                                queue[idx].1.task_id
-                            );
-                            info!("{}", "~~~~~".repeat(15));
-                        }
-
-                        drop(order);
-                        return Ok(queue.swap_remove(idx));
-                    }
-                }
-
-                if DEBUG {
-                    info!("try_simple_schedule: PICK RANDOM NON-YIELD TASK -> cannot find");
-                    info!("{}", "~~~~~".repeat(15));
-                }
-
-                // bz: cannot find any task in queue that is not in order
-                return Ok(queue.swap_remove(0));
-
-                // let mut idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-                // let mut info = &queue[idx];
-                // while order.iter().any(|i| i.task_id == info.1.task_id) {
-                //     idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-                //     info = &queue[idx];
-                // }
-                // info!(
-                //     "try_simple_schedule: PICK RANDOM NON-YIELD TASK with idx = {:?}",
-                //     info.1.task_id
-                // );
-                // info!("{}", "~~~~~".repeat(15));
-                // drop(order);
-
-                // return Ok(queue.swap_remove(idx));
-            }
-            drop(order);
-
-            // bz: randomly choose one task, since RELEASE = false or order.len() == 0
-            let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-
-            if DEBUG {
-                info!("try_simple_schedule: RANDOM TASK with idx = {:?}", idx);
-            }
-
             Ok(queue.swap_remove(idx))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)

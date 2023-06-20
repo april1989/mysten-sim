@@ -177,17 +177,41 @@ MSIM_EXHAUSTIVE=true RUSTFLAGS="--cfg msim" cargo test
 
 - "We observe that threads in correct programs indicate when they are unable to make progress by yielding the processor. A yield is usually indicated by the presence of a sleep operation or a timeout while waiting on a resource." - Fair Stateless Model Checking
 
-
-
-### Next
-
-1. caller/location of where `instrumented_yield()` is called: 
-
-
+ 
 
 ### statically detected races in Sui
 
 1. guarded by `RwLockWriteGuard`
 2. 10 points of race pairs, force the order of a pair of instrumented_yield()
 3. `MSIM_TEST_SCHEDULE=11-22 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest test_create_advance_epoch_tx_race`
+4. `MSIM_TEST_SCHEDULE=1-2,0-3 RUSTFLAGS="--cfg msim" cargo test`
+
+
+### get the caller of async closure
+https://github.com/tokio-rs/async-backtrace/blob/main/backtrace/examples/taskdump.rs
+
+
+
+### instrumented points in sui 
+`fastpath_objects_available` does not exist in this Sui commit.
+
+authority_store:
+1. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:507` instrumented_yield in execute_change_epoch_tx (in for loop) (race 1:1) 
+2. `crates/sui-core/src/consensus_handler.rs:385` instrumented_yield in AsyncTransactionScheduler::run (in while loop) (race 1:2 3:1 3:2 4:1 5:2)
+3. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:516` instrumented_yield in acquire_shared_locks_from_effects (in for loop) (race 2:1)
+4. `crates/sui-core/src/authority_server.rs:392` instrumented_yield in handle_certificate (race 2:2 4:2) -> *cannot reach* because `is_full_node=false`@`crates/sui-node/src/lib.rs` is not a validator
+5. `crates/sui-core/src/checkpoints/mod.rs:834` instrumented_yield in create_checkpoints-true (in for loop) (race 5:1)
+
+`MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5`
+`MSIM_TEST_SCHEDULE=1-2,2-2,5-2`
+
+```rust
+            use sui_macros::{instrumented_yield_id};
+            println!("instrumented_yield in xxx");
+            instrumented_yield_id!(22);
+```
+
+executed_effects:
+1. ``
+
 
