@@ -5,7 +5,7 @@ use super::{
     rand::GlobalRng,
     runtime,
     time::{TimeHandle, TimeRuntime},
-    // utils::mpsc,
+    utils::mpsc,
 };
 use crate::assert_send_sync;
 use async_task::{FallibleTask, Runnable};
@@ -38,7 +38,7 @@ pub mod join_set;
 pub use join_set::JoinSet;
 
 pub(crate) struct Executor {
-    queue: Receiver,
+    queue: mpsc::Receiver<(Runnable, Arc<TaskInfo>)>,
     handle: TaskHandle,
     rand: GlobalRng,
     time: TimeRuntime,
@@ -137,8 +137,7 @@ fn kill_current_node_impl(handle: runtime::Handle, restart_after: Option<Duratio
 }
 
 /// bz: remove crate-private, since we need it in channel/Sender/Receiver
-// pub(crate) struct TaskInfo {
-pub struct TaskInfo {
+pub(crate) struct TaskInfo {
     inner: Arc<NodeInfo>,
     /// A flag indicating that the task should be paused.
     paused: AtomicBool,
@@ -191,7 +190,6 @@ impl PartialEq for TaskInfo {
     }
 }
 impl Eq for TaskInfo {}
-
 
 #[derive(Default)]
 struct YieldToScheduler(Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>);
@@ -250,8 +248,8 @@ impl Future for YieldToScheduler {
 /// woken.  However, we do guarantee not to wake the future until execution has returned to the
 /// scheduler.
 pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    info!("calling instrumented_yield"); // bz: debug
-                                         // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+    // info!("calling instrumented_yield"); // bz: debug
+    // info!("instrumented_yield backtrace:\n{}", std::backtrace::Backtrace::force_capture());
 
     Box::pin(YieldToScheduler::default())
 }
@@ -275,13 +273,16 @@ thread_local! {
 static INPUT_SCHEDULE: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: from MSIM_TEST_SCHEDULE
 
 /// bz: flags
-pub const DEBUG: bool = true; // bz: DEBUG = true: print out necessary debug info
+pub const DEBUG: bool = false; // bz: DEBUG = true: print out necessary debug info
 const DEBUG_DETAIL: bool = false; // bz: DEBUG_DETAIL = true: print out all debug info, this can be super long
 
 /// bz: size of YIELD_TASKS
 pub fn size_of_yield_tasks() -> usize {
     return YIELD_TASKS.with(|yield_tasks| {
         let yield_tasks = yield_tasks.lock().unwrap();
+        if DEBUG {
+            info!("yield_tasks len = {:?}", yield_tasks.len());
+        }
         yield_tasks.len()
     });
 }
@@ -292,7 +293,7 @@ struct SkipScheduler(Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>>);
 impl Future for SkipScheduler {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Ready(())
     }
 }
@@ -406,19 +407,17 @@ pub fn instrumented_yield_id(id: usize) -> Pin<Box<dyn Future<Output = ()> + Sen
         let mut yield_ids = yield_ids.lock().unwrap();
         yield_ids.push(id);
         if DEBUG {
-            warn!(
+            info!(
                 "instrumented_yield_id yield_ids: {:?} (after push)",
                 yield_ids
             );
-        }
-
-        if DEBUG {
             info!(
                 "#input_schedule: {}, #yield_ids: {}",
                 input_schedule.len(),
                 yield_ids.len()
             );
         }
+
         if input_schedule.len() > 0 && input_schedule.len() == yield_ids.len() {
             READY_TO_RELEASE.with(|ready_to_release| {
                 let mut ready_to_release = ready_to_release.lock().unwrap();
@@ -437,7 +436,6 @@ pub fn instrumented_yield_id(id: usize) -> Pin<Box<dyn Future<Output = ()> + Sen
                 });
             });
         }
-        drop(input_schedule);
     });
 
     YIELD_TASKINFOS.with(|yield_infos| {
@@ -474,24 +472,7 @@ pub fn set_input_schedule(test_schedule_x: Vec<usize>) {
 
 impl Executor {
     pub fn new(rand: GlobalRng) -> Self {
-        // let test_schedule_str =
-        //     std::env::var("MSIM_TEST_SCHEDULE").unwrap_or_else(|_| String::new());
-        // let test_schedule: Vec<&str> = test_schedule_str.split('-').collect();
-        // let test_schedule_x: Vec<usize> = test_schedule
-        //     .iter()
-        //     .map(|s| s.parse::<usize>().unwrap())
-        //     .collect();
-
-        // INPUT_SCHEDULE.with(|input_schedule| {
-        //     let mut input_schedule = input_schedule.lock().unwrap();
-        //     *input_schedule = test_schedule_x.clone();
-        // });
-
-        // if DEBUG {
-        //     info!("Test Schedule: {:?}", test_schedule_x);
-        // }
-
-        let (sender, queue) = channel();
+        let (sender, queue) = mpsc::channel();
         Executor {
             queue,
             handle: TaskHandle {
@@ -538,10 +519,6 @@ impl Executor {
                 return val;
             }
 
-            //// bz: debug
-            // info!("polling task in block_on: {:?}", task);
-            // info!("polling task in block_on() after run_all_ready()");
-
             let going = self.time.advance_to_next_event();
             assert!(going, "no events, the task will block forever");
             if let Some(limit) = self.time_limit {
@@ -585,7 +562,6 @@ impl Executor {
         }));
 
         while let Ok((runnable, info)) = self.queue.try_recv_random(&self.rand) {
-            // while let Ok((runnable, info)) = self.queue.try_simple_schedule(&self.rand) {
             // normal execution
             if *info.killed.borrow() {
                 // killed task: must enter the task before dropping it, so that
@@ -602,21 +578,22 @@ impl Executor {
 
             // run task
             if DEBUG && info.name() != "main" {
-                YIELD_TASKINFOS.with(|yield_taskinfos|{
+                YIELD_TASKINFOS.with(|yield_taskinfos| {
                     let mut yield_taskinfos = yield_taskinfos.lock().unwrap();
-                if yield_taskinfos.contains(&info) {
-                    info!(
-                        // bz: debug
-                        "-> executor running task with node id {:?}, name {:?}, task id {:?}",
-                        info.node(),
-                        info.name(),
-                        info.task_id,
-                    );
+                    if yield_taskinfos.contains(&info) {
+                        info!(
+                            // bz: debug
+                            "-> executor running task with node id {:?}, name {:?}, task id {:?}",
+                            info.node(),
+                            info.name(),
+                            info.task_id,
+                        );
 
-                    if let Some(index) = yield_taskinfos.iter().position(|value| *value == info) {
-                        yield_taskinfos.swap_remove(index);
+                        if let Some(index) = yield_taskinfos.iter().position(|value| *value == info)
+                        {
+                            yield_taskinfos.swap_remove(index);
+                        }
                     }
-                }
                 });
             }
 
@@ -688,7 +665,7 @@ impl Deref for Executor {
 
 #[derive(Clone)]
 pub(crate) struct TaskHandle {
-    sender: Sender,
+    sender: mpsc::Sender<(Runnable, Arc<TaskInfo>)>,
     nodes: Arc<Mutex<HashMap<NodeId, Node>>>,
     next_node_id: Arc<AtomicU64>,
     next_task_id: Arc<AtomicU64>,
@@ -706,13 +683,13 @@ struct Node {
 }
 
 impl TaskHandle {
-    /// bz: push paused node id to paused_node_id
+    /// bz: push node id to paused_node_id
     pub fn push_paused_node_id(&self, id: NodeId) {
         let mut paused_node_id = self.paused_node_id.lock().unwrap();
         paused_node_id.push(id.into());
     }
 
-    /// bz: resume the paused node id from paused_node_id
+    /// bz: resume the node id from paused_node_id
     pub fn resume_paused_node_id(&self) {
         let paused_node_id = self.paused_node_id.lock().unwrap();
         if paused_node_id.len() == 0 {
@@ -829,7 +806,7 @@ impl TaskHandle {
 
 #[derive(Clone)]
 pub(crate) struct TaskNodeHandle {
-    sender: Sender,
+    sender: mpsc::Sender<(Runnable, Arc<TaskInfo>)>,
     info: Arc<TaskInfo>,
 }
 
@@ -858,7 +835,7 @@ impl TaskNodeHandle {
     {
         // bz: this is a new task spawned by the node, create a new info
         let handle = runtime::Handle::current();
-        let mut next_task_id = handle.task.next_task_id;
+        let next_task_id = handle.task.next_task_id;
         let new_task_id = TaskId(next_task_id.fetch_add(1, Ordering::SeqCst));
         let new_info = Arc::new(TaskInfo::new(
             self.info.inner.node,
@@ -887,9 +864,12 @@ impl TaskNodeHandle {
         F::Output: 'static,
     {
         let sender = self.sender.clone();
-        let info = self.info.clone();
+        let info = if let Some(_new_info) = new_info.clone() { // bz: we check the correct info
+            _new_info.clone()
+        } else {
+            self.info.clone()
+        };
         let mut killed_rx = info.killed.subscribe();
-        let _info = self.info.clone();
 
         let future = async move {
             pin_mut!(future);
@@ -903,7 +883,7 @@ impl TaskNodeHandle {
                             // killed. (Otherwise the task will not be dropped until its next
                             // scheduled wakeup, which may be never if it is listening for network
                             // messages).
-                            panic!("killed task must not run! node id {:?}, name {:?}, task id {:?}", _info.inner.node, _info.inner.name, _info.task_id);
+                            panic!("killed task must not run!");
                         }
                     }
 
@@ -1013,7 +993,7 @@ where
     // as input parameter, but I did not see this function been triggered yet
     // tmp give it a None
     info!(
-        "crate::task::spawn_local()\nbacktrace:\n{}",
+        "NOTE: crate::task::spawn_local()\nbacktrace:\n{}",
         std::backtrace::Backtrace::force_capture()
     ); // bz: debug
     handle.spawn_local(future, None)
@@ -1444,104 +1424,104 @@ mod tests {
     }
 }
 
-/// bz: mpsc for executor, remove generic types. NOTE: the following code should be separate from the file ... however, its hard ...
-///! A multi-producer, single-consumer queue but allows
-///! consumer to randomly choose an element from the queue.
-// use crate::rand::GlobalRng;
-// use rand::Rng;
-use std::sync::Weak;
+// /// bz: mpsc for executor, remove generic types. NOTE: the following code should be separate from the file ... however, its hard ...
+// ///! A multi-producer, single-consumer queue but allows
+// ///! consumer to randomly choose an element from the queue.
+// // use crate::rand::GlobalRng;
+// // use rand::Rng;
+// use std::sync::Weak;
 
-/// Creates a new asynchronous channel, returning the sender/receiver halves.
-pub fn channel() -> (Sender, Receiver) {
-    let inner = Arc::new(Inner {
-        queue: Mutex::new(Vec::new()),
-    });
-    let sender = Sender {
-        inner: Arc::downgrade(&inner),
-    };
-    let recver = Receiver { inner };
-    (sender, recver)
-}
+// /// Creates a new asynchronous channel, returning the sender/receiver halves.
+// pub fn channel() -> (Sender, Receiver) {
+//     let inner = Arc::new(Inner {
+//         queue: Mutex::new(Vec::new()),
+//     });
+//     let sender = Sender {
+//         inner: Arc::downgrade(&inner),
+//     };
+//     let recver = Receiver { inner };
+//     (sender, recver)
+// }
 
-/// The sending-half of Rust’s asynchronous [`channel`] type.
-pub struct Sender {
-    inner: Weak<Inner>,
-}
+// /// The sending-half of Rust’s asynchronous [`channel`] type.
+// pub struct Sender {
+//     inner: Weak<Inner>,
+// }
 
-/// The receiving half of Rust’s [`channel`] type.
-pub struct Receiver {
-    inner: Arc<Inner>,
-}
+// /// The receiving half of Rust’s [`channel`] type.
+// pub struct Receiver {
+//     inner: Arc<Inner>,
+// }
 
-struct Inner {
-    queue: Mutex<Vec<(Runnable, Arc<TaskInfo>)>>,
-}
+// struct Inner {
+//     queue: Mutex<Vec<(Runnable, Arc<TaskInfo>)>>,
+// }
 
-impl Clone for Sender {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
+// impl Clone for Sender {
+//     fn clone(&self) -> Self {
+//         Self {
+//             inner: self.inner.clone(),
+//         }
+//     }
+// }
 
-impl<T> fmt::Debug for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SendError").finish_non_exhaustive()
-    }
-}
+// impl<T> fmt::Debug for SendError<T> {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_struct("SendError").finish_non_exhaustive()
+//     }
+// }
 
-/// An error returned from the `Sender::send` function on channels.
-pub struct SendError<T>(pub T);
+// /// An error returned from the `Sender::send` function on channels.
+// pub struct SendError<T>(pub T);
 
-impl Sender {
-    /// Attempts to send a value on this channel, returning it back if it could not be sent.
-    pub fn send(
-        &self,
-        value: (Runnable, Arc<TaskInfo>),
-    ) -> Result<(), SendError<(Runnable, Arc<TaskInfo>)>> {
-        if let Some(inner) = self.inner.upgrade() {
-            inner.queue.lock().unwrap().push(value);
-            Ok(())
-        } else {
-            Err(SendError(value))
-        }
-    }
-}
+// impl Sender {
+//     /// Attempts to send a value on this channel, returning it back if it could not be sent.
+//     pub fn send(
+//         &self,
+//         value: (Runnable, Arc<TaskInfo>),
+//     ) -> Result<(), SendError<(Runnable, Arc<TaskInfo>)>> {
+//         if let Some(inner) = self.inner.upgrade() {
+//             inner.queue.lock().unwrap().push(value);
+//             Ok(())
+//         } else {
+//             Err(SendError(value))
+//         }
+//     }
+// }
 
-/// This enumeration is the list of the possible reasons
-/// that `try_recv_random` could not return data when called.
-pub enum TryRecvError {
-    /// empty
-    Empty,
-    /// disconnected
-    Disconnected,
-}
+// /// This enumeration is the list of the possible reasons
+// /// that `try_recv_random` could not return data when called.
+// pub enum TryRecvError {
+//     /// empty
+//     Empty,
+//     /// disconnected
+//     Disconnected,
+// }
 
-impl Receiver {
-    /// Attempts to return a pending value on this receiver without blocking.
-    pub fn try_recv_random(
-        &self,
-        rng: &GlobalRng,
-    ) -> Result<(Runnable, Arc<TaskInfo>), TryRecvError> {
-        let mut queue = self.inner.queue.lock().unwrap();
-        if !queue.is_empty() {
-            let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            Ok(queue.swap_remove(idx))
-        } else if Arc::weak_count(&self.inner) == 0 {
-            Err(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
-        }
-    }
+// impl Receiver {
+//     /// Attempts to return a pending value on this receiver without blocking.
+//     pub fn try_recv_random(
+//         &self,
+//         rng: &GlobalRng,
+//     ) -> Result<(Runnable, Arc<TaskInfo>), TryRecvError> {
+//         let mut queue = self.inner.queue.lock().unwrap();
+//         if !queue.is_empty() {
+//             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
+//             Ok(queue.swap_remove(idx))
+//         } else if Arc::weak_count(&self.inner) == 0 {
+//             Err(TryRecvError::Disconnected)
+//         } else {
+//             Err(TryRecvError::Empty)
+//         }
+//     }
 
-    /// clear
-    pub fn clear_inner(&self) {
-        let mut old = Vec::new();
-        {
-            let mut queue = self.inner.queue.lock().unwrap();
-            std::mem::swap(&mut old, &mut queue);
-        }
-        // must release lock before dropping queue.
-    }
-}
+//     /// clear
+//     pub fn clear_inner(&self) {
+//         let mut old = Vec::new();
+//         {
+//             let mut queue = self.inner.queue.lock().unwrap();
+//             std::mem::swap(&mut old, &mut queue);
+//         }
+//         // must release lock before dropping queue.
+//     }
+// }

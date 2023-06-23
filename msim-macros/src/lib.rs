@@ -159,10 +159,15 @@ pub fn sim_test(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
     let args = syn::parse_macro_input!(args as syn::AttributeArgs);
 
-    // parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
-    parse_test_schedule(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    let _schedule_str = std::env::var("MSIM_TEST_SCHEDULE");
+    if _schedule_str.is_ok() {
+        parse_test_schedule(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    }else{
+        parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    }
 }
 
+/// bz: use MSIM_TEST_SCHEDULE
 fn parse_test_schedule(
     mut input: syn::ItemFn,
     args: syn::AttributeArgs,
@@ -240,7 +245,7 @@ fn parse_test_schedule(
             let mut count: u64 = if let Ok(num_str) = std::env::var("MSIM_TEST_NUM") {
                 num_str.parse().expect("MSIM_TEST_NUM should be an integer")
             } else {
-                1
+                2 // bz: each input schedule run twice
             };
             let time_limit_s = std::env::var("MSIM_TEST_TIME_LIMIT").ok().map(|num_str| {
                 num_str.parse::<f64>().expect("MSIM_TEST_TIME_LIMIT should be an number")
@@ -270,11 +275,15 @@ fn parse_test_schedule(
             let mut return_value = None;
             for (j, s) in test_schedules.iter().enumerate() {
                 let test_schedule: Vec<&str> = s.split('-').collect();
-                let test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
-                #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
+                let mut test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
 
             for i in 0..count {
                 let mut inner_seed = seed;
+                if i == 1 {
+                    // bz: reverse the schedule and run the test again
+                    test_schedule_x.reverse();
+                }
+                #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
                 #crate_ident::tracing::info!("starting test iteration {:?} with seed {}", i, inner_seed);
                 #crate_ident::task::set_input_schedule(test_schedule_x.clone());
 
@@ -346,7 +355,8 @@ fn parse_test_schedule(
                 if !check {
                     seed = next_seed(seed);
                 }
-            }
+            } 
+
             }
             return_value.unwrap()
         }

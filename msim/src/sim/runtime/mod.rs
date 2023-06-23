@@ -305,19 +305,15 @@ impl Handle {
         context::try_current(|h| h.clone())
     }
 
-    /// bz: before deleting/killing a node, let's make sure there is no yield tasks waiting
-    /// return true and pause the progress if there are yield tasks
+    /// bz: before deleting/killing a node, let's make sure there is no unfinished tasks
+    /// we will terminate them when Executor::block_on() returns
     fn check_yield_tasks(&self, id: NodeId) -> bool {
-        let len_tasks = crate::task::size_of_yield_tasks();
-        if len_tasks > 0 {
-            if crate::task::DEBUG {
-                tracing::info!("handler going to kill/delete this node with {:?}", id);
-            }
-            self.pause(id);
-            self.task.push_paused_node_id(id);
-            return true;
+        if crate::task::DEBUG {
+            tracing::info!("handler going to kill/delete this node with {:?}", id);
         }
-        return false;
+        self.pause(id);
+        self.task.push_paused_node_id(id);
+        return true;
     }
 
     /// Kill a node.
@@ -344,6 +340,7 @@ impl Handle {
 
     /// Kill all tasks and delete the node.
     pub fn delete_node(&self, id: NodeId) {
+        // tracing::info!("Handle:delete_node: {:?}", id); // bz: debug
         if self.check_yield_tasks(id) {
             return;
         }

@@ -85,20 +85,6 @@ impl<T> Receiver<T> {
         }
     }
 
-    // bz: a simplest try: we always let idx == queue.len() - 1 run firstly
-    pub fn try_simple_schedule(&self) -> Result<T, TryRecvError> {
-        let mut queue = self.inner.queue.lock().unwrap();
-        if !queue.is_empty() {
-            let idx = queue.len() - 1;
-            // tracing::info!("try_simple_schedule: idx = {:?}", idx);
-            Ok(queue.swap_remove(idx))
-        } else if Arc::weak_count(&self.inner) == 0 {
-            Err(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
-        }
-    }
-
     pub fn clear_inner(&self) {
         let mut old = Vec::new();
         {
