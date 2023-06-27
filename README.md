@@ -34,8 +34,8 @@ MSIM_TEST_SCHEDULE=11-22 LOCAL_MSIM_PATH=$path_to_our_msim cargo simtest test_cr
 1. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:507` instrumented_yield in execute_change_epoch_tx (in for loop) (race 1:1) 
 2. `crates/sui-core/src/consensus_handler.rs:385` instrumented_yield in AsyncTransactionScheduler::run (in while loop) (race 1:2 3:1 3:2 4:1 5:2)
 3. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:516` instrumented_yield in acquire_shared_locks_from_effects (in for loop) (race 2:1)
-4. `crates/sui-core/src/authority_server.rs:392` instrumented_yield in handle_certificate (race 2:2 4:2) -> *cannot reach* because `is_full_node=false`@`crates/sui-node/src/lib.rs` is not a validator; only node id = 1 is a validator
-5. `crates/sui-core/src/checkpoints/mod.rs:834` instrumented_yield in create_checkpoints-true (in for loop) (race 5:1)
+4. `crates/sui-core/src/authority_server.rs:392` instrumented_yield in handle_certificate (race 2:2 4:2 6:1) -> *cannot reach* because `is_full_node=false`@`crates/sui-node/src/lib.rs` is not a validator; only node id = 1 is a validator
+5. `crates/sui-core/src/checkpoints/mod.rs:834` instrumented_yield in create_checkpoints-true (in for loop) (race 5:1 6:2)
 
 `MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5` 
 
