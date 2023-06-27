@@ -174,23 +174,13 @@ MSIM_EXHAUSTIVE=true RUSTFLAGS="--cfg msim" cargo test
 
 
 ### Insights
-
-- "We observe that threads in correct programs indicate when they are unable to make progress by yielding the processor. A yield is usually indicated by the presence of a sleep operation or a timeout while waiting on a resource." - Fair Stateless Model Checking
+- *** manually write test case + sleep is hard to control (may fail or miss) -> high efficiency, benefit to developers ***
 
  
 
 ### statically detected races in Sui
 
-1. guarded by `RwLockWriteGuard`
-2. 10 points of race pairs, force the order of a pair of instrumented_yield()
-3. `MSIM_TEST_SCHEDULE=11-22 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest test_create_advance_epoch_tx_race`
-4. `MSIM_TEST_SCHEDULE=1-2,0-3 RUSTFLAGS="--cfg msim" cargo test`
-
-
-### get the caller of async closure
-https://github.com/tokio-rs/async-backtrace/blob/main/backtrace/examples/taskdump.rs
-
-
+`/sui_race/races.json` and `sui_race/races-authority_store.json`
 
 ### instrumented points in sui 
 
@@ -200,9 +190,7 @@ https://github.com/tokio-rs/async-backtrace/blob/main/backtrace/examples/taskdum
             instrumented_yield_id!(xx);
 ```
 
-`fastpath_objects_available` does not exist in this Sui commit.
-
-authority_store:
+authority_store: instrument 5 program points for 6 race pairs
 1. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:507` instrumented_yield in execute_change_epoch_tx (in for loop) (race 1:1) 
 2. `crates/sui-core/src/consensus_handler.rs:385` instrumented_yield in AsyncTransactionScheduler::run (in while loop) (race 1:2 3:1 3:2 4:1 5:2)
 3. `crates/sui-core/src/checkpoints/checkpoint_executor/mod.rs:516` instrumented_yield in acquire_shared_locks_from_effects (in for loop) (race 2:1)
@@ -211,27 +199,46 @@ authority_store:
 
 `MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5`
 `MSIM_TEST_SCHEDULE=1-2,2-2,5-2`
+ 
+
+### todo
+1. cargo simtest -> failed?
+`MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest test_create_advance_epoch_tx_race &>  log-test_create_advance_epoch_tx_race-0-instru-taskid23-fix3-delay3.txt`
 
 
-### batch 
-`our.sh` and `run.sh`
 
-### ready for meeting
-1. demo (no recompilation)
-2. other tests: `sui/crates/sui/tests/full_node_tests.rs` 
+### run cargo simtest
+
+`#[sim_test]` = 134
+
+default: 
+- `cargo simtest`
+- Summary [ 616.726s] 669 tests run: 664 passed (23 slow), 5 failed, 595 skipped
+- 5 failures due to no resource for the test 
+
+our: 
+- `MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest --no-fail-fast`
+- Summary [4561.277s] 670 tests run: 564 passed (15 slow), 106 failed, 595 skipped
+- 79 failures due to no resource for the test (27 failures)
+  * log_all-simtest_ours5-debug.txt -> non-stopping tests
+  * log_all-simtest_ours6-debug.txt -> non-stopping tests
+  * log_all-simtest_ours8-debug-skip.txt, log_all-simtest_ours9-debug-skip.txt -> skip non-stopping tests and release and run a single yield task
+  * log_all-simtest_ours10-debugp.txt ->  use `--test-threads=1` to avoid SIGABRT tests
+
+1. `test_protocol_version_upgrade_forced`, `reconfig_with_revert_end_to_end_test` cannot terminate (> 20000s)
+2. `smoke_test` various completion time (448.934s vs. > 4000s)
+
+
+
+
+#### problems
+1. `sui-json-rpc rpc_server_test::test_staking`, `rpc_server_test::test_staking_multiple_coins` cannot smoothly shutdown after testing all schedules
+2. `sui-benchmark::simtest test::test_upgrade_compatibility`, `test-utils::network_tests test_package_override`, `sui::protocol_version_tests sim_only_tests::test_protocol_version_upgrade_with_shutdown_validator`, `test_process_transaction_fault_fail` ??
+
 
 
 ### difficulties
 1. loop/context-insensitive: calling context/stack sensitive by backtrace 
 2. the distance between instrumented point and racy point
 3. even though there were a race, no way to know if it causes errors triggered by a race
-
-
-### todo
-1. cargo simtest -> failed?
-2. *** manually write test case + sleep is hard to control (may fail or miss) *** -> high efficiency, benefit to developers
-
-`MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest test_create_advance_epoch_tx_race &>  log-test_create_advance_epoch_tx_race-0-instru-taskid23-fix3-delay3.txt`
-
-
 
