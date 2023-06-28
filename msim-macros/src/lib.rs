@@ -271,18 +271,39 @@ fn parse_test_schedule(
                 #crate_ident::rand::GlobalRng::new_with_seed(seed).gen::<u64>()
             }
 
+            fn skip_schedule(j: usize, test_schedule_x: Vec<usize>) -> bool {
+                if !#crate_ident::task::seen_the_schedule(test_schedule_x.clone()) { 
+                    #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
+                    #crate_ident::tracing::info!("{:?}. skip test schedule: {:?}. this test cannot hit both instrumented points.", j, test_schedule_x);
+                    return true;
+                }
+                return false;
+            }
+
             let mut rand_log = None;
             let mut return_value = None;
             for (j, s) in test_schedules.iter().enumerate() {
                 let test_schedule: Vec<&str> = s.split('-').collect();
                 let mut test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
 
+                if j > 0 && skip_schedule(j, test_schedule_x.clone()) {
+                    continue; // bz: skip impossible schedules
+                }
+
             for i in 0..count {
+                if j == 0 && i == 1 { // bz: skip impossible schedules
+                    #crate_ident::task::order_seen_ids();
+                    if skip_schedule(j, test_schedule_x.clone()) {
+                        continue; 
+                    }
+                }
+
                 let mut inner_seed = seed;
                 if i == 1 {
                     // bz: reverse the schedule and run the test again
                     test_schedule_x.reverse();
                 }
+                #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
                 #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
                 #crate_ident::tracing::info!("starting test iteration {:?} with seed {}", i, inner_seed);
                 #crate_ident::task::set_input_schedule(test_schedule_x.clone());

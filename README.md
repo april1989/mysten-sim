@@ -47,12 +47,8 @@ default:
 
 our: 
 - `MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest --no-fail-fast --test-threads=1`
-- `sui_race/log_all-simtest_ours10-debug.txt` and `sui_race/log_all-simtest_ours10-debug-trim.txt`
-- all failures https://docs.google.com/spreadsheets/d/17KeLScCbLzSDi-_h57pmrtQH_Ffi5Jfa5XY4FAatdoc/edit?usp=sharing
+- logs are at `sui_race/log_all-simtest_ours10-debug.txt` and `sui_race/log_all-simtest_ours10-debug-trim.txt`
+- all failures are here: https://docs.google.com/spreadsheets/d/17KeLScCbLzSDi-_h57pmrtQH_Ffi5Jfa5XY4FAatdoc/edit?usp=sharing
 
 
-### difficulties
-1. loop/context-insensitive: calling context/stack sensitive by backtrace 
-2. the distance between instrumented point and racy point
-3. even though there were a race, no way to know if it causes errors triggered by a race
 

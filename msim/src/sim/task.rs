@@ -14,7 +14,7 @@ use erasable::{ErasablePtr, ErasedPtr};
 use futures::pin_mut;
 use rand::Rng;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     ops::Deref,
@@ -198,10 +198,12 @@ impl Future for YieldToScheduler {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        info!(
-            "polling backtrace: {}",
-            std::backtrace::Backtrace::force_capture()
-        ); // bz: debug
+        if DEBUG {
+            info!(
+                "polling backtrace: {}",
+                std::backtrace::Backtrace::force_capture()
+            ); // bz: debug
+        }
 
         // capture the current stack trace
         LAST_CAPTURE.with(|last_capture| {
@@ -254,9 +256,9 @@ pub fn instrumented_yield() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(YieldToScheduler::default())
 }
 
-fn take_last_capture() -> Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>> {
-    LAST_CAPTURE.with(|last_capture| last_capture.lock().unwrap().take())
-}
+// fn take_last_capture() -> Option<Arc<(Arc<TaskInfo>, Waker, Backtrace)>> {
+//     LAST_CAPTURE.with(|last_capture| last_capture.lock().unwrap().take())
+// }
 
 // Instrumentation to capture the stack trace of points of interest in the code.
 // Code can call `instrumented_yield` to allow the scheduler to see the stack trace
@@ -270,11 +272,51 @@ thread_local! {
     static YIELD_TASKINFOS: Mutex<Vec<Arc<TaskInfo>>> = Mutex::new(Vec::new()); // bz: the order of yield tasks
 }
 
+static FINAL_RELEASE: AtomicBool = AtomicBool::new(false); // bz: release a single yield task before turning off all nodes
 static INPUT_SCHEDULE: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: from MSIM_TEST_SCHEDULE
+static SEEN_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new()); // bz: seen instrumented points/ID from MSIM_TEST_SCHEDULE in iteration 0
+/// bz: if recording seen_ids
+pub static RECORD: AtomicBool = AtomicBool::new(true); 
+
 
 /// bz: flags
-pub const DEBUG: bool = false; // bz: DEBUG = true: print out necessary debug info
+pub const DEBUG: bool = true; // bz: DEBUG = true: print out necessary debug info
 const DEBUG_DETAIL: bool = false; // bz: DEBUG_DETAIL = true: print out all debug info, this can be super long
+
+/// bz: remove duplicate ids in seen_ids 
+pub fn order_seen_ids() {
+    let mut seen_ids = SEEN_IDS.lock().unwrap();
+    *seen_ids = seen_ids.clone().into_iter()
+    .collect::<HashSet<_>>()
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    RECORD.store(false, Ordering::SeqCst);
+
+    if DEBUG {
+        info!("{}", "=====".repeat(16));
+        info!("Seen IDs from MSIM_TEST_SCHEDULE in the first test run: {:?}", seen_ids);
+        info!("{}", "=====".repeat(16));
+    }
+}
+
+/// bz: we have seen the instrumented points/ids in the schedule from iteration 0
+pub fn seen_the_schedule(schedule: Vec<usize>) -> bool {
+    let seen_ids = SEEN_IDS.lock().unwrap();
+    //// if seen any one id 
+    // if seen_ids.contains(schedule[0]) || seen_ids.contains(schedule[1]) {
+    //     return true; 
+    // }
+    // return false;
+
+    // if seen both ids
+    for id in schedule.iter() {
+        if !seen_ids.contains(id) { 
+            return false;
+        }
+    }
+    return true;
+}
 
 /// bz: size of YIELD_TASKS
 pub fn size_of_yield_tasks() -> usize {
@@ -285,6 +327,27 @@ pub fn size_of_yield_tasks() -> usize {
         }
         yield_tasks.len()
     });
+}
+
+/// bz: just in case we only yield one task from INPUT_SCHEDULE, then the task would yield forever.
+/// wake it up and let it done before killing all nodes
+pub fn release_yield_tasks() {
+    if DEBUG {
+        info!("waking up yield tasks before killing all nodes.")
+    }
+    YIELD_TASKS.with(|yield_tasks| {
+        let mut yield_tasks = yield_tasks.lock().unwrap();
+        for (_id, waker) in yield_tasks.clone().into_iter() {
+            waker.wake_by_ref();
+        }
+        yield_tasks.clear();
+    });
+
+    if DEBUG {
+        warn!("set FINAL_RELEASE to true");
+    }
+
+    FINAL_RELEASE.store(true, Ordering::SeqCst);
 }
 
 #[derive(Default)]
@@ -305,9 +368,9 @@ impl Future for YieldToSchedulerX {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        info!("{}", "*****".repeat(16));
         let info = context::current_task(); // bz: current task info
         if DEBUG {
+            info!("{}", "*****".repeat(16));
             info!(
                 // bz: debug
                 "YieldToSchedulerX id: {:?}, node id {:?}, name {:?}, task id {:?}",
@@ -344,6 +407,11 @@ impl Future for YieldToSchedulerX {
             }
         });
 
+        let final_release = FINAL_RELEASE.load(Ordering::SeqCst);
+        if final_release {
+            release = true;
+        }
+
         if release {
             if DEBUG {
                 info!("YieldToSchedulerX ready");
@@ -371,10 +439,22 @@ impl Future for YieldToSchedulerX {
 /// Capture the current stack trace and attempt to yield execution back to the scheduler.
 /// with an id
 pub fn instrumented_yield_id(id: usize) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    let final_release = FINAL_RELEASE.load(Ordering::SeqCst);
+    if final_release {
+        return Box::pin(SkipScheduler::default());
+    }
+
     let info = context::current_task();
     let input_schedule = INPUT_SCHEDULE.lock().unwrap();
     let in_input_schedule = input_schedule.contains(&id);
 
+    let record = RECORD.load(Ordering::SeqCst);
+    if record{
+        // store seen ids
+        let mut seen_ids = SEEN_IDS.lock().unwrap();
+        seen_ids.push(id);
+    }
+    
     if info.inner.node.0 != 2 || !in_input_schedule {
         // do nothing
         if DEBUG_DETAIL {
@@ -459,7 +539,9 @@ pub fn instrumented_yield_id(id: usize) -> Pin<Box<dyn Future<Output = ()> + Sen
         }
     });
 
-    info!("{}", "-----".repeat(16));
+    if DEBUG {
+        info!("{}", "-----".repeat(16));
+    }
 
     Box::pin(YieldToSchedulerX(id))
 }
@@ -510,9 +592,19 @@ impl Executor {
         loop {
             self.run_all_ready();
             if let Poll::Ready(val) = Pin::new(&mut task).poll(&mut cx) {
+                // bz: check if we have a dangling yield task
+                if size_of_yield_tasks() > 0 {
+                    release_yield_tasks();
+                    if DEBUG {
+                        info!("executor: the last run to complete the yield task.");
+                    }
+                    self.run_all_ready();
+                }
+
                 if DEBUG {
                     info!("executor: done");
                 }
+
                 // bz: resume the paused kill/delete node tasks
                 self.handle.resume_paused_node_id();
 
@@ -864,7 +956,8 @@ impl TaskNodeHandle {
         F::Output: 'static,
     {
         let sender = self.sender.clone();
-        let info = if let Some(_new_info) = new_info.clone() { // bz: we check the correct info
+        let info = if let Some(_new_info) = new_info.clone() {
+            // bz: we check the correct info
             _new_info.clone()
         } else {
             self.info.clone()

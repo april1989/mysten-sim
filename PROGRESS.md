@@ -239,6 +239,22 @@ our:
 
 ### difficulties
 1. loop/context-insensitive: calling context/stack sensitive by backtrace 
-2. the distance between instrumented point and racy point
+2. the distance between instrumented point and racy point (from Mark)
+ - thread-level interruption/scheduler: to choose which task to run next
+ - lock-level: hold and release whenever the scheduler needs
 3. even though there were a race, no way to know if it causes errors triggered by a race
+4. * automatic generating workload: replay real user's transaction traffic originated from one object
+
+epoch [i'pok]
+
+
+
+
+## ** proposal: developing testing framework for DS ** 
+1. context-sensitive 
+2. "if not instrumenting async functions" - from Mark's
+3. scalability
+
+
+
 
