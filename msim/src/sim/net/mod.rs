@@ -533,6 +533,29 @@ define_sys_interceptor!(
 );
 
 define_sys_interceptor!(
+    fn getsockopt(
+        socket: libc::c_int,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: *mut libc::c_void,
+        option_len: libc::socklen_t,
+    ) -> libc::c_int {
+        trace!("getsockopt({}, {}, {})", socket, level, name);
+        match (level, name) {
+            // called by anemo::Network::start (via socket2)
+            // skip returning any value here since Sui only uses it to log an error anyway
+            (libc::SOL_SOCKET, libc::SO_RCVBUF) |
+            (libc::SOL_SOCKET, libc::SO_SNDBUF) => 0,
+
+            _ => {
+                warn!("unhandled getsockopt {} {}", level, name);
+                0
+            }
+        }
+    }
+);
+
+define_sys_interceptor!(
     fn setsockopt(
         socket: libc::c_int,
         level: libc::c_int,
@@ -554,6 +577,11 @@ define_sys_interceptor!(
             // called by rust std::net::UdpSocket::bind
             #[cfg(target_os = "macos")]
             (libc::SOL_SOCKET, libc::SO_NOSIGPIPE) => 0,
+
+            // called by anemo::Network::start (via socket2)
+            // no need to emulate socket buffers
+            (libc::SOL_SOCKET, libc::SO_RCVBUF) => 0,
+            (libc::SOL_SOCKET, libc::SO_SNDBUF) => 0,
 
             // Call by quinn, no need to emulate (for now)
             (libc::IPPROTO_IP, libc::IP_RECVTOS) => 0,
@@ -577,7 +605,7 @@ define_sys_interceptor!(
             (libc::IPPROTO_TCP, libc::TCP_KEEPALIVE) => 0,
 
             _ => {
-                warn!("unhandled socket option {} {}", level, name);
+                warn!("unhandled setsockopt {} {}", level, name);
                 0
             }
         }
