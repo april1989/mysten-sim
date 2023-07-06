@@ -496,7 +496,7 @@ impl NodeHandle {
         F: Future + 'static,
         F::Output: 'static,
     {
-        self.task.spawn_local(future)
+        self.task.spawn_local(future, None)
     }
 
     /// Join the node.
