@@ -305,25 +305,11 @@ impl Handle {
         context::try_current(|h| h.clone())
     }
 
-    /// bz: before deleting/killing a node, let's make sure there is no unfinished tasks
-    /// we will terminate them when Executor::block_on() returns
-    fn check_yield_tasks(&self, id: NodeId) -> bool {
-        if crate::task::DEBUG {
-            tracing::info!("handler going to kill/delete this node with {:?}", id);
-        }
-        self.pause(id);
-        self.task.push_paused_node_id(id);
-        return true;
-    }
-
     /// Kill a node.
     ///
     /// - All tasks spawned on this node will be killed immediately.
     /// - All data that has not been flushed to the disk will be lost.
     pub fn kill(&self, id: NodeId) {
-        if self.check_yield_tasks(id) {
-            return;
-        }
         self.task.kill(id);
         for sim in self.sims.lock().unwrap().values() {
             sim.reset_node(id);
@@ -340,10 +326,6 @@ impl Handle {
 
     /// Kill all tasks and delete the node.
     pub fn delete_node(&self, id: NodeId) {
-        // tracing::info!("Handle:delete_node: {:?}", id); // bz: debug
-        if self.check_yield_tasks(id) {
-            return;
-        }
         debug!("delete_node {id}");
         self.task.delete_node(id);
         for sim in self.sims.lock().unwrap().values() {
@@ -419,7 +401,7 @@ impl<'a> NodeBuilder<'a> {
         F: Future + 'static,
     {
         self.init = Some(Arc::new(move |handle| {
-            handle.spawn_local(future(), None);
+            handle.spawn_local(future());
         }));
         self
     }
@@ -496,7 +478,7 @@ impl NodeHandle {
         F: Future + 'static,
         F::Output: 'static,
     {
-        self.task.spawn_local(future, None)
+        self.task.spawn_local(future)
     }
 
     /// Join the node.

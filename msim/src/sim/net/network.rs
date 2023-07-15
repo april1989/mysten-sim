@@ -421,9 +421,6 @@ impl Network {
     }
 
     pub fn recv(&mut self, node: NodeId, dst: SocketAddr, tag: u64) -> oneshot::Receiver<Message> {
-        // if !self.nodes.contains_key(&node) { // bz: debug
-        //     info!("recv: self.nodes does not have key of {node}, #self.nodes = {:?}", self.nodes.len());
-        // }
         self.nodes[&node].sockets[&dst.port()]
             .lock()
             .unwrap()

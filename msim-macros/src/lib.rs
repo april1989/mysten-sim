@@ -160,11 +160,11 @@ pub fn sim_test(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = syn::parse_macro_input!(args as syn::AttributeArgs);
 
     let _schedule_str = std::env::var("MSIM_TEST_SCHEDULE");
-    if _schedule_str.is_ok() {
-        parse_test_schedule(input, args).unwrap_or_else(|e| e.to_compile_error().into())
-    }else{
-        parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
-    }
+    // if _schedule_str.is_ok() {
+        parse_test_schedule(input, args).unwrap_or_else(|e: syn::Error| e.to_compile_error().into())
+    // }else{
+    //     parse_test(input, args).unwrap_or_else(|e| e.to_compile_error().into())
+    // }
 }
 
 /// bz: use MSIM_TEST_SCHEDULE
@@ -245,7 +245,7 @@ fn parse_test_schedule(
             let mut count: u64 = if let Ok(num_str) = std::env::var("MSIM_TEST_NUM") {
                 num_str.parse().expect("MSIM_TEST_NUM should be an integer")
             } else {
-                2 // bz: each input schedule run twice
+                1 
             };
             let time_limit_s = std::env::var("MSIM_TEST_TIME_LIMIT").ok().map(|num_str| {
                 num_str.parse::<f64>().expect("MSIM_TEST_TIME_LIMIT should be an number")
@@ -280,33 +280,15 @@ fn parse_test_schedule(
                 return false;
             }
 
+            #crate_ident::task::clear_seen_ids(); // bz: clear SEEN_IDS for the previous test
+
             let mut rand_log = None;
             let mut return_value = None;
-            for (j, s) in test_schedules.iter().enumerate() {
-                let test_schedule: Vec<&str> = s.split('-').collect();
-                let mut test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
-
-                if j > 0 && skip_schedule(j, test_schedule_x.clone()) {
-                    continue; // bz: skip impossible schedules
-                }
-
-            for i in 0..count {
-                if j == 0 && i == 1 { // bz: skip impossible schedules
-                    #crate_ident::task::order_seen_ids();
-                    if skip_schedule(j, test_schedule_x.clone()) {
-                        continue; 
-                    }
-                }
-
+            for i in 0..count { // bz: collect SEEN_IDS
                 let mut inner_seed = seed;
-                if i == 1 {
-                    // bz: reverse the schedule and run the test again
-                    test_schedule_x.reverse();
-                }
                 #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
-                #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
+                #crate_ident::tracing::info!("0. no schedule:");  
                 #crate_ident::tracing::info!("starting test iteration {:?} with seed {}", i, inner_seed);
-                #crate_ident::task::set_input_schedule(test_schedule_x.clone());
 
                 let config = std::thread::spawn(move || {
                     let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default());
@@ -355,7 +337,6 @@ fn parse_test_schedule(
                             let _ = stop_tx.send(());
                             watchdog.join().unwrap();
                             std::mem::drop(rt_read);
-
                             let log = rt.write().unwrap().take().unwrap().take_rand_log();
                             (ret, log)
                         }).join();
@@ -376,9 +357,111 @@ fn parse_test_schedule(
                 if !check {
                     seed = next_seed(seed);
                 }
-            } 
-
             }
+            
+            if test_schedules.len() == 1 &&  test_schedules[0] == "" {
+                #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
+                #crate_ident::tracing::info!("no input schedules, return.");
+                return return_value.unwrap();  
+            }
+            if #crate_ident::task::order_seen_ids() {
+                #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
+                #crate_ident::tracing::info!("skip input schedules, since no seen instrumneted ids.");
+                return return_value.unwrap(); // bz: no seen ids, no need to run the following
+            }
+            #crate_ident::task::set_use_schedule(); 
+            count = 2; // bz: each input schedule run twice
+            
+            // bz: run input schedules if we can see both instrumented ids in the input schedule
+            for (j, s) in test_schedules.iter().enumerate() {
+                let test_schedule: Vec<&str> = s.split('-').collect();
+                let mut test_schedule_x: Vec<usize> = test_schedule.iter().map(|s| s.parse::<usize>().unwrap()).collect();
+                if skip_schedule(j, test_schedule_x.clone()) {
+                    continue; // bz: skip impossible schedules
+                }
+
+                for i in 0..count {
+                    let mut inner_seed = seed;
+                    if i == 1 {
+                        // bz: reverse the schedule and run the test again
+                        test_schedule_x.reverse();
+                    }
+                    #crate_ident::tracing::info!("{}", "%%%%%".repeat(16));
+                    #crate_ident::tracing::info!("{:?}. test schedule: {:?}", j, test_schedule_x);
+                    #crate_ident::tracing::info!("starting test iteration {:?} with seed {}", i, inner_seed);
+                    #crate_ident::task::set_input_schedule(test_schedule_x.clone());
+
+                    let config = std::thread::spawn(move || {
+                        let rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, #crate_ident::SimConfig::default());
+                        rt.block_on(async move {
+                            // run config_expr inside runtime so it can access rng.
+                            #config_expr
+                        })
+                    }).join().expect("config generation thread panicked!");
+
+                    let test_config: #crate_ident::TestConfig = config.into();
+                     if check {
+                        assert_eq!(
+                            test_config.configs.len(), 1,
+                            "can't check determinism with repeated test"
+                        );
+                    }
+
+                    for (repeat, sim_config) in test_config.configs.iter() {
+                        assert_ne!(*repeat, 0);
+                        if check {
+                            assert_eq!(
+                                *repeat, 1,
+                                "can't check determinism with repeated test"
+                            );
+                        }
+
+                        for _j in 0..*repeat {
+                            let sim_config = sim_config.clone();
+                            let rand_log0 = rand_log.take();
+                            let res = std::thread::spawn(move || {
+                                let mut rt = #crate_ident::runtime::Runtime::with_seed_and_config(inner_seed, sim_config);
+                                if check {
+                                    rt.enable_determinism_check(rand_log0);
+                                }
+                                if let Some(limit) = time_limit_s {
+                                    rt.set_time_limit(::std::time::Duration::from_secs_f64(limit));
+                                }
+                                let rt = std::sync::Arc::new(std::sync::RwLock::new(Some(rt)));
+                                let (stop_tx, stop_rx) = ::tokio::sync::oneshot::channel();
+                                let watchdog = #crate_ident::runtime::start_watchdog(
+                                    rt.clone(), inner_seed, watchdog_timeout, stop_rx
+                                );
+
+                                let rt_read = rt.read().unwrap();
+                                let ret = rt_read.as_ref().unwrap().block_on(async #body);
+                                let _ = stop_tx.send(());
+                                watchdog.join().unwrap();
+                                std::mem::drop(rt_read);
+    
+                                let log = rt.write().unwrap().take().unwrap().take_rand_log();
+                                (ret, log)
+                            }).join();
+                            match res {
+                                Ok((ret, log)) => {
+                                    return_value = Some(ret);
+                                    rand_log = log;
+                                }
+                                Err(e) => {
+                                    println!("note: run with `MSIM_TEST_SEED={}` environment variable to reproduce this error", inner_seed);
+                                    ::std::panic::resume_unwind(e);
+                                }
+                            }
+                            inner_seed += 1;
+                        }
+                    }
+
+                    if !check {
+                        seed = next_seed(seed);
+                    }
+                } 
+            }
+
             return_value.unwrap()
         }
     })
@@ -490,6 +573,7 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
                 #crate_ident::rand::GlobalRng::new_with_seed(seed).gen::<u64>()
             }
 
+                        
             let mut rand_log = None;
             let mut return_value = None;
             for i in 0..count {
@@ -565,6 +649,7 @@ fn parse_test(mut input: syn::ItemFn, args: syn::AttributeArgs) -> Result<TokenS
                     seed = next_seed(seed);
                 }
             }
+
             return_value.unwrap()
         }
     })

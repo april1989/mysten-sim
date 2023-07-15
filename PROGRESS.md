@@ -259,6 +259,8 @@ epoch [i'pok]
 
 
 ### sync with upstream sui
+
+```shell
 git checkout main
 git remote add upstream https://github.com/MystenLabs/sui.git
 git fetch upstream
@@ -276,4 +278,14 @@ git commit -m "merge with instrumented_yield_id"
 git push origin main
 
 MSIM_TEST_SCHEDULE=1-2,3-4,2-2,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest --no-fail-fast --test-threads=1 &> $(pwd)/logs/log_06292023.txt
+MSIM_TEST_SCHEDULE=1-2,3-4,2-4,5-2,4-5 LOCAL_MSIM_PATH=/home/ubuntu/mysten-sim-x cargo simtest --no-fail-fast --test-threads=1 &> $(pwd)/logs/log_06292023.txt
+```
+
+```
+test_simulated_load_reconfig_with_crashes_and_delays
+test_active_address_command
+```
+
+#### reference to nextest
+https://nexte.st/book/running.html#options-and-arguments 
 

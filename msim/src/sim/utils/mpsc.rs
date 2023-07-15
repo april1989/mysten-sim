@@ -76,7 +76,6 @@ impl<T> Receiver<T> {
         let mut queue = self.inner.queue.lock().unwrap();
         if !queue.is_empty() {
             let idx = rng.with(|rng| rng.gen_range(0..queue.len()));
-            // tracing::info!("rand idx = {:?} with queue.len = {:?}", idx, queue.len()); // bz: debug
             Ok(queue.swap_remove(idx))
         } else if Arc::weak_count(&self.inner) == 0 {
             Err(TryRecvError::Disconnected)
